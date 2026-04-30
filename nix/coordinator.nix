@@ -3,6 +3,10 @@
 let
   cfg = config.services.wgmesh-coord;
 
+  # Allowlist file location is internal — declared by `authorizedSigners` /
+  # `authorizedSignerFiles` and rendered by this module. Not user-overridable.
+  signersFile = "/etc/wgmesh/authorized_signers";
+
   # The coordinator always runs the WG hub (it's both an HTTP server *and*
   # a WireGuard peer with every agent). Field naming reflects that — no
   # `relay` jargon, just plain "wg" since WireGuard is the only data path.
@@ -12,7 +16,7 @@ let
     tls_key            = cfg.tlsKey;
     mesh_cidr          = cfg.meshCidr;
     state_path         = "${cfg.stateDir}/state.json";
-    authorized_signers = cfg.authorizedSignersPath;
+    authorized_signers = signersFile;
     peer_ttl_seconds   = cfg.peerTTLSeconds;
     wg_ssh_key         = cfg.sshKeyPath;
     wg_interface       = cfg.interface;
@@ -22,9 +26,8 @@ let
   };
   configFile = pkgs.writeText "wgmesh-coord.json" (builtins.toJSON configAttrs);
 
-  # Declarative allowlist: inline strings + files, both optional. Combined
-  # contents are rendered to authorizedSignersPath via environment.etc; the
-  # systemd service's reloadTriggers carries the hash so changes auto-SIGHUP.
+  # Declarative allowlist: inline strings + files concatenated. Rendered
+  # to signersFile via environment.etc; reloadTriggers carries the hash.
   fromList  = lib.concatStringsSep "\n" cfg.authorizedSigners;
   fromFiles = lib.concatMapStringsSep "\n"
     (f: lib.removeSuffix "\n" (builtins.readFile f))
@@ -32,7 +35,6 @@ let
   renderedSigners =
     let parts = lib.filter (s: s != "") [ fromList fromFiles ];
     in if parts == [] then "" else (lib.concatStringsSep "\n" parts) + "\n";
-  hasInlineSigners = cfg.authorizedSigners != [] || cfg.authorizedSignerFiles != [];
 
   listenPortFromAddr =
     let parts = lib.splitString ":" cfg.listenAddr;
@@ -64,10 +66,10 @@ in
       ];
       description = ''
         Inline OpenSSH ed25519 public key lines authorizing nodes to join
-        the mesh. Rendered to `authorizedSignersPath` at activation time.
-        Changing this list automatically reloads the coord (SIGHUP via
-        `systemd.services.wgmesh-coord.reloadTriggers`); no manual
-        `systemctl reload` step.
+        the mesh. Concatenated with `authorizedSignerFiles` and rendered
+        to `/etc/wgmesh/authorized_signers` declaratively. Changing this
+        list automatically reloads the coord on activation (SIGHUP via
+        `systemd.services.wgmesh-coord.reloadTriggers`); no manual step.
       '';
     };
 
@@ -76,10 +78,9 @@ in
       default = [];
       example = lib.literalExpression ''[ ./pubkeys/node-a.pub ./pubkeys/node-b.pub ]'';
       description = ''
-        Paths to OpenSSH `.pub` files; concatenated with `authorizedSigners`
-        into the rendered allowlist. Useful when keys live in their own
-        per-node files (e.g. checked into the flake from each host's first
-        boot).
+        Paths to OpenSSH `.pub` files; their contents are concatenated
+        with `authorizedSigners` into the rendered allowlist. Useful when
+        per-node pubkeys live in their own files in the flake.
       '';
     };
 
@@ -98,16 +99,6 @@ in
     };
 
     ## Advanced (sensible defaults) -------------------------------------------
-
-    authorizedSignersPath = lib.mkOption {
-      type = lib.types.path;
-      default = "/etc/wgmesh/authorized_signers";
-      description = ''
-        Path to the allowlist file. Auto-rendered from `authorizedSigners`
-        / `authorizedSignerFiles` when either is non-empty; otherwise place
-        the file here yourself (e.g. via sops-nix / agenix).
-      '';
-    };
 
     endpointHost = lib.mkOption {
       type = lib.types.str;
@@ -179,25 +170,18 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = !hasInlineSigners
-          || cfg.authorizedSignersPath == "/etc/wgmesh/authorized_signers";
-        message = ''
-          services.wgmesh-coord.authorizedSigners (or authorizedSignerFiles)
-          render to /etc/wgmesh/authorized_signers. Either keep the default
-          authorizedSignersPath, or clear the inline lists and manage the
-          file yourself (e.g. via sops-nix).
-        '';
-      }
-    ];
-
-    # Declarative allowlist → /etc/wgmesh/authorized_signers.
-    environment.etc = lib.mkIf hasInlineSigners {
-      "wgmesh/authorized_signers" = {
-        mode = "0644";
-        text = renderedSigners;
-      };
+    # The allowlist file is always declared — even when both lists are
+    # empty (first-bootstrap state, before any agent pubkeys are pasted in).
+    # Coord starts, accepts no requests until the lists grow, then a
+    # subsequent `nixos-rebuild` triggers SIGHUP via reloadTriggers.
+    environment.etc."wgmesh/authorized_signers" = {
+      mode = "0644";
+      text = ''
+        # wgmesh authorized signers — managed by NixOS.
+        # Source of truth: services.wgmesh-coord.authorizedSigners
+        #                  services.wgmesh-coord.authorizedSignerFiles
+        # Edit those options in your flake; do NOT edit this file by hand.
+      '' + renderedSigners;
     };
 
     systemd.tmpfiles.rules = [
@@ -237,7 +221,7 @@ in
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_NETLINK" "AF_UNIX" ];
 
         ReadWritePaths = [ cfg.stateDir ];
-        ReadOnlyPaths = [ cfg.sshKeyPath cfg.authorizedSignersPath ]
+        ReadOnlyPaths = [ cfg.sshKeyPath signersFile ]
           ++ lib.optional (cfg.tlsCert != "") cfg.tlsCert
           ++ lib.optional (cfg.tlsKey != "") cfg.tlsKey;
       };
