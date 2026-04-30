@@ -1,5 +1,7 @@
 # wgmesh
 
+**English** · [简体中文](./README.zh-CN.md)
+
 > **Zero-config WireGuard mesh for NixOS fleets. `nixos-rebuild switch` and the mesh is up.**
 
 No key generation. No enrollment files. No `tailscale up` interactive step on
