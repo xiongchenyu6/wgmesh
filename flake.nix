@@ -13,6 +13,11 @@
     flake-utils.lib.eachSystem systems (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        mkApp = name: {
+          type = "app";
+          program = "${wgmesh}/bin/${name}";
+          meta.description = "wgmesh ${name}";
+        };
         wgmesh = pkgs.rustPlatform.buildRustPackage {
           pname = "wgmesh";
           version = "0.1.0";
@@ -48,6 +53,16 @@
         packages = {
           default = wgmesh;
           wgmesh = wgmesh;
+        };
+
+        # `nix run .#<name>` for each binary the workspace produces.
+        # `nix run .` and `nix run .#default` map to the coordinator.
+        apps = {
+          default          = mkApp "wgmesh-coord";
+          wgmesh-coord     = mkApp "wgmesh-coord";
+          wgmesh-agent     = mkApp "wgmesh-agent";
+          ssh-to-wg        = mkApp "ssh-to-wg";
+          wgmesh-smoketest = mkApp "wgmesh-smoketest";
         };
 
         devShells.default = pkgs.mkShell {
