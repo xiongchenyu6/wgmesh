@@ -64,12 +64,14 @@ fn make_cfg(state: &Path, signers_path: &Path) -> Arc<wgmesh_coord::config::Conf
         state_path: state.to_string_lossy().into_owned(),
         authorized_signers: signers_path.to_string_lossy().into_owned(),
         peer_ttl: Duration::from_secs(600),
-        relay_enabled: false,
-        relay_ssh_key: String::new(),
-        relay_interface: String::new(),
-        relay_listen_port: 0,
-        relay_endpoint: String::new(),
-        relay_mesh_ip: String::new(),
+        // Tests bypass `wgmesh_coord::run()` and construct AppState below
+        // with `relay: None`, so the WG-hub fields are unused but must be
+        // present in the struct.
+        wg_ssh_key: String::new(),
+        wg_interface: String::new(),
+        wg_listen_port: 0,
+        wg_endpoint_host: String::new(),
+        wg_mesh_ip: String::new(),
         network_addr: Ipv4Addr::new(10, 42, 0, 0),
         prefix_bits: 16,
     })

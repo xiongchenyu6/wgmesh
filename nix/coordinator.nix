@@ -3,6 +3,9 @@
 let
   cfg = config.services.wgmesh-coord;
 
+  # The coordinator always runs the WG hub (it's both an HTTP server *and*
+  # a WireGuard peer with every agent). Field naming reflects that — no
+  # `relay` jargon, just plain "wg" since WireGuard is the only data path.
   configAttrs = lib.filterAttrs (n: v: v != null && v != "") {
     listen_addr        = cfg.listenAddr;
     tls_cert           = cfg.tlsCert;
@@ -11,17 +14,13 @@ let
     state_path         = "${cfg.stateDir}/state.json";
     authorized_signers = cfg.authorizedSignersPath;
     peer_ttl_seconds   = cfg.peerTTLSeconds;
-    relay_ssh_key      = cfg.sshKeyPath;
-    relay_interface    = cfg.interface;
-    relay_listen_port  = cfg.wgListenPort;
-    relay_endpoint     = cfg.endpoint;
-    relay_mesh_ip      = cfg.meshIP;
+    wg_ssh_key         = cfg.sshKeyPath;
+    wg_interface       = cfg.interface;
+    wg_listen_port     = cfg.wgListenPort;
+    wg_endpoint_host   = cfg.endpointHost;
+    wg_mesh_ip         = cfg.meshIP;
   };
-  # The coordinator always runs wg0 (it's both an HTTP server *and* a
-  # WireGuard peer with every agent); the JSON layer keeps `relay_enabled`
-  # for the test path, but at the NixOS layer it isn't a user choice.
-  configFile = pkgs.writeText "wgmesh-coord.json"
-    (builtins.toJSON (configAttrs // { relay_enabled = true; }));
+  configFile = pkgs.writeText "wgmesh-coord.json" (builtins.toJSON configAttrs);
 
   listenPortFromAddr =
     let parts = lib.splitString ":" cfg.listenAddr;
@@ -42,16 +41,6 @@ in
       type = lib.types.str;
       example = "10.42.0.0/16";
       description = "IPv4 CIDR for mesh IP allocation.";
-    };
-
-    endpoint = lib.mkOption {
-      type = lib.types.str;
-      example = "vps.example.com:51820";
-      description = ''
-        Public `host:port` that agents reach over UDP to talk to the
-        coordinator's WireGuard interface. Must resolve to (and be
-        reachable from) every mesh node.
-      '';
     };
 
     authorizedSignersPath = lib.mkOption {
@@ -76,13 +65,31 @@ in
 
     ## Advanced (sensible defaults) -------------------------------------------
 
+    endpointHost = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "wg.example.com";
+      description = ''
+        OPTIONAL override for the hostname agents reach the coordinator's
+        WireGuard on. Empty (the default) means: agents derive the host
+        from their own `services.wgmesh.coordinator` URL — set this only
+        when WG must run on a different domain than HTTP (e.g., HTTP is
+        behind a TCP-only CDN that can't proxy UDP).
+      '';
+    };
+
+    wgListenPort = lib.mkOption {
+      type = lib.types.port;
+      default = 51820;
+      description = "UDP port the coordinator's WG interface listens on; published to agents via /peers.";
+    };
+
     sshKeyPath = lib.mkOption {
       type = lib.types.path;
       default = "/etc/ssh/ssh_host_ed25519_key";
       description = ''
-        OpenSSH ed25519 host key used to derive the coordinator's
-        WireGuard keypair. Default = the host key your `services.openssh`
-        already manages.
+        OpenSSH ed25519 host key used to derive the coordinator's WG keypair.
+        Default = the host key your `services.openssh` already manages.
       '';
     };
 
@@ -90,12 +97,6 @@ in
       type = lib.types.str;
       default = "wg0";
       description = "Kernel WireGuard interface name on the coordinator.";
-    };
-
-    wgListenPort = lib.mkOption {
-      type = lib.types.port;
-      default = 51820;
-      description = "UDP port the coordinator's WG interface listens on (matches the port in `endpoint`).";
     };
 
     meshIP = lib.mkOption {
@@ -146,7 +147,6 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" "sshd.service" ];
       wants = [ "network-online.target" ];
-      # `wg` and `ip` are shelled out to; both must be in PATH.
       path = [ pkgs.iproute2 pkgs.wireguard-tools pkgs.coreutils ];
 
       serviceConfig = {
@@ -155,8 +155,6 @@ in
         Restart = "always";
         RestartSec = 5;
 
-        # Privileges: coord manages a kernel WG interface, so it needs
-        # CAP_NET_ADMIN. Run as root for that capability.
         User = "root";
         AmbientCapabilities = [ "CAP_NET_ADMIN" ];
         CapabilityBoundingSet = [ "CAP_NET_ADMIN" "CAP_NET_RAW" "CAP_SYS_MODULE" ];

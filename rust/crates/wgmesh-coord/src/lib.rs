@@ -13,38 +13,30 @@ use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
-/// Bring up coord: load config, open store, start relay (if enabled), serve HTTP.
-/// Reload signers on SIGHUP, periodic relay reconcile every 30s.
+/// Bring up coord: load config, open store, start the WG hub, serve HTTP.
+/// Reload signers on SIGHUP, periodic WG-peer reconcile every 30s.
 pub async fn run(config_path: &str) -> Result<()> {
     let cfg = Arc::new(config::load(config_path)?);
-    info!(addr = %cfg.listen_addr, mesh = %cfg.mesh_cidr, relay = cfg.relay_enabled, "coord starting");
+    info!(addr = %cfg.listen_addr, mesh = %cfg.mesh_cidr, "coord starting");
 
-    let reserved: Vec<&str> = if cfg.relay_enabled {
-        vec![cfg.relay_mesh_ip.as_str()]
-    } else {
-        vec![]
-    };
     let store = Arc::new(store::Store::open(
         &cfg.state_path,
         cfg.network_addr,
         cfg.prefix_bits,
-        &reserved,
+        &[cfg.wg_mesh_ip.as_str()],
     )?);
 
     let signers = signers::Signers::load(&cfg.authorized_signers)
         .context("load authorized_signers")?;
 
-    let relay = if cfg.relay_enabled {
-        Some(Arc::new(relay::Relay::start(cfg.clone(), store.clone())?))
-    } else {
-        None
-    };
+    // Coord *always* runs the WG hub: every agent is one of its peers.
+    let relay = Arc::new(relay::Relay::start(cfg.clone(), store.clone())?);
 
     let state = server::AppState {
         cfg: cfg.clone(),
         store: store.clone(),
         signers: signers.clone(),
-        relay: relay.clone(),
+        relay: Some(relay.clone()),
     };
 
     // SIGHUP → reload allowlist.
@@ -61,8 +53,9 @@ pub async fn run(config_path: &str) -> Result<()> {
         });
     }
 
-    // Periodic relay reconcile (30s).
-    if let Some(r) = relay.clone() {
+    // Periodic WG-peer reconcile (30s).
+    {
+        let r = relay.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.tick().await; // skip immediate
@@ -73,7 +66,7 @@ pub async fn run(config_path: &str) -> Result<()> {
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}")))
                 {
-                    warn!("periodic relay reconcile: {e}");
+                    warn!("periodic WG reconcile: {e}");
                 }
             }
         });

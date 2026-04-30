@@ -40,10 +40,21 @@ pub struct Peer {
 
 /// Description of the coordinator's WireGuard hub. When present in `/peers`,
 /// agents install it as a peer with `AllowedIPs = mesh_cidr` (the catch-all).
+///
+/// **No `endpoint` field on the wire.** The coord publishes only its WG
+/// listen `port`; the agent derives the host from its own `coordinator`
+/// URL (no need to repeat the same hostname twice in two different configs).
+/// `host` is an optional override, used only when the WG hostname must
+/// differ from the HTTP hostname (e.g., HTTP behind a TCP-only CDN).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relay {
     pub wg_public_key: String,
-    pub endpoint: String,
+    /// Optional host override. Empty string → agent derives from the
+    /// `coordinator` URL it's already configured with.
+    #[serde(default)]
+    pub host: String,
+    /// Coord's WG UDP listen port. Always populated.
+    pub port: u16,
     pub mesh_ip: String,
     pub mesh_cidr: String,
 }
@@ -79,7 +90,8 @@ mod tests {
             self_pubkey: "abc".into(),
             relay: Some(Relay {
                 wg_public_key: "K".into(),
-                endpoint: "h:51820".into(),
+                host: String::new(),
+                port: 51820,
                 mesh_ip: "10.42.0.1".into(),
                 mesh_cidr: "10.42.0.0/16".into(),
             }),
@@ -87,5 +99,6 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"relay\""));
+        assert!(s.contains("\"port\":51820"));
     }
 }

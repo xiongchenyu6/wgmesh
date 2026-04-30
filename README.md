@@ -131,9 +131,11 @@ live. Once a handshake lands, we promote to `/32` atomically.
   services.wgmesh-coord = {
     enable                = true;
     meshCidr              = "10.42.0.0/16";
-    endpoint              = "vps.example.com:51820";   # public WG UDP host:port
     authorizedSignersPath = "/etc/wgmesh/authorized_signers";
     openFirewall          = true;
+    # No endpoint to configure: agents already know coord's hostname
+    # (it's the host part of their `services.wgmesh.coordinator` URL),
+    # and the WG port is published via /peers (default 51820).
   };
   services.coturn = { enable = true; listening-port = 3478; no-tls = true;
     no-dtls = true; use-auth-secret = false; no-auth = true; };
@@ -228,7 +230,6 @@ flake. Here's a complete one-VPS-plus-N-agents setup:
             services.wgmesh-coord = {
               enable                = true;
               meshCidr              = "10.42.0.0/16";
-              endpoint              = "vps.example.com:51820";
               authorizedSignersPath = "/etc/wgmesh/authorized_signers";
               openFirewall          = true;
             };

@@ -119,9 +119,11 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
   services.wgmesh-coord = {
     enable                = true;
     meshCidr              = "10.42.0.0/16";
-    endpoint              = "vps.example.com:51820";   # 公网 WG UDP host:port
     authorizedSignersPath = "/etc/wgmesh/authorized_signers";
     openFirewall          = true;
+    # 不用配 endpoint：agent 已经知道 coord 的 hostname
+    # （它就是 agent 自己 services.wgmesh.coordinator URL 里的 host），
+    # WG 端口由 coord 通过 /peers 广播（默认 51820）。
   };
   services.coturn = { enable = true; listening-port = 3478; no-tls = true;
     no-dtls = true; use-auth-secret = false; no-auth = true; };
@@ -212,7 +214,6 @@ cd rust && cargo test --workspace        # 44 个测试通过
             services.wgmesh-coord = {
               enable                = true;
               meshCidr              = "10.42.0.0/16";
-              endpoint              = "vps.example.com:51820";
               authorizedSignersPath = "/etc/wgmesh/authorized_signers";
               openFirewall          = true;
             };

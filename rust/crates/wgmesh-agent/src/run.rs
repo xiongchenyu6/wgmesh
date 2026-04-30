@@ -102,7 +102,18 @@ fn iterate(
     }
 
     // 3. Fetch peers + relay info.
-    let pr = cc.peers()?;
+    let mut pr = cc.peers()?;
+    // Coord publishes only its WG port; the host comes from the URL we
+    // already use to talk to coord. Operator can override via
+    // `wg_endpoint_host` on the coord side, in which case `relay.host` is
+    // already populated and we leave it.
+    if let Some(r) = pr.relay.as_mut() {
+        if r.host.is_empty() {
+            if let Some(h) = host_from_url(&cfg.coordinator) {
+                r.host = h;
+            }
+        }
+    }
 
     // 4. Read kernel handshake state.
     let hs = wm.handshakes()?;
@@ -138,6 +149,32 @@ fn stun_on_port(server: &str, port: u16) -> Result<SocketAddr> {
     }
 }
 
+/// Extract the host portion from `https://host[:port][/path]`. IPv6 hosts
+/// keep their brackets so the result is suitable as the host part of a
+/// `wg`-style `Endpoint = host:port` line.
+pub(crate) fn host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    // strip path/query/fragment if present
+    let host_port = after_scheme
+        .split_once(|c: char| c == '/' || c == '?' || c == '#')
+        .map(|p| p.0)
+        .unwrap_or(after_scheme);
+    if host_port.starts_with('[') {
+        // bracketed IPv6: keep `[..]` but drop any trailing `:port`
+        let close = host_port.find(']')?;
+        Some(host_port[..=close].to_string())
+    } else {
+        // hostname or IPv4 — strip optional `:port`
+        Some(
+            host_port
+                .split_once(':')
+                .map(|p| p.0)
+                .unwrap_or(host_port)
+                .to_string(),
+        )
+    }
+}
+
 fn read_hostname_or_unknown() -> String {
     std::process::Command::new("hostname")
         .output()
@@ -146,4 +183,42 @@ fn read_hostname_or_unknown() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_from_url_strips_scheme_path_and_port() {
+        assert_eq!(
+            host_from_url("https://mesh.example.com:8443").as_deref(),
+            Some("mesh.example.com")
+        );
+        assert_eq!(
+            host_from_url("http://10.0.0.1").as_deref(),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            host_from_url("https://api.example.com/path?q=1").as_deref(),
+            Some("api.example.com")
+        );
+    }
+
+    #[test]
+    fn host_from_url_keeps_ipv6_brackets() {
+        assert_eq!(
+            host_from_url("https://[2001:db8::1]:8443").as_deref(),
+            Some("[2001:db8::1]")
+        );
+        assert_eq!(
+            host_from_url("https://[::1]/path").as_deref(),
+            Some("[::1]")
+        );
+    }
+
+    #[test]
+    fn host_from_url_returns_none_when_scheme_missing() {
+        assert_eq!(host_from_url("mesh.example.com:8443"), None);
+    }
 }

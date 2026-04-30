@@ -1,7 +1,8 @@
-//! Coordinator JSON config, with the same defaulting rules as the Go original.
+//! Coordinator JSON config.
 //!
-//! Notably: `relay_enabled` defaults to **true** when absent. We use
-//! `Option<bool>` so we can distinguish "user wrote false" from "user omitted".
+//! The coord *always* runs a kernel-WG hub (see `relay.rs`); there's no
+//! "disable" toggle in production. The `wg_endpoint_host` field is optional —
+//! when empty, agents derive the host from their own `coordinator` URL.
 
 use serde::Deserialize;
 use std::net::Ipv4Addr;
@@ -22,10 +23,8 @@ pub enum ConfigError {
     MissingStatePath,
     #[error("authorized_signers is required")]
     MissingAuthorizedSigners,
-    #[error("relay_endpoint is required when relay_enabled (host:port reachable from agents)")]
-    RelayMissingEndpoint,
-    #[error("relay_mesh_ip {0} is not a valid IPv4 inside mesh_cidr")]
-    InvalidRelayMeshIp(String),
+    #[error("wg_mesh_ip {0} is not a valid IPv4 inside mesh_cidr")]
+    InvalidWgMeshIp(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,12 +36,13 @@ struct Raw {
     state_path: Option<String>,
     authorized_signers: Option<String>,
     peer_ttl_seconds: Option<i64>,
-    relay_enabled: Option<bool>,
-    relay_ssh_key: Option<String>,
-    relay_interface: Option<String>,
-    relay_listen_port: Option<u16>,
-    relay_endpoint: Option<String>,
-    relay_mesh_ip: Option<String>,
+    wg_ssh_key: Option<String>,
+    wg_interface: Option<String>,
+    wg_listen_port: Option<u16>,
+    /// Optional override for the hostname agents reach the coord's WG on.
+    /// Empty → agents derive it from their `coordinator` URL host.
+    wg_endpoint_host: Option<String>,
+    wg_mesh_ip: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,12 +55,12 @@ pub struct Config {
     pub authorized_signers: String,
     pub peer_ttl: Duration,
 
-    pub relay_enabled: bool,
-    pub relay_ssh_key: String,
-    pub relay_interface: String,
-    pub relay_listen_port: u16,
-    pub relay_endpoint: String,
-    pub relay_mesh_ip: String,
+    pub wg_ssh_key: String,
+    pub wg_interface: String,
+    pub wg_listen_port: u16,
+    /// May be empty — agents derive from coordinator URL when so.
+    pub wg_endpoint_host: String,
+    pub wg_mesh_ip: String,
 
     /// Network address of `mesh_cidr`, masked. Used by Store for allocation.
     pub network_addr: Ipv4Addr,
@@ -98,22 +98,19 @@ fn from_raw(raw: Raw) -> Result<Config, ConfigError> {
     let peer_ttl_secs = raw.peer_ttl_seconds.filter(|&v| v > 0).unwrap_or(600);
     let peer_ttl = Duration::from_secs(peer_ttl_secs as u64);
 
-    // Default-true semantics: only false if user explicitly wrote `"relay_enabled": false`.
-    let relay_enabled = raw.relay_enabled.unwrap_or(true);
-
-    let relay_ssh_key = raw
-        .relay_ssh_key
+    let wg_ssh_key = raw
+        .wg_ssh_key
         .unwrap_or_else(|| "/etc/ssh/ssh_host_ed25519_key".into());
-    let relay_interface = raw.relay_interface.unwrap_or_else(|| "wg0".into());
-    let relay_listen_port = raw.relay_listen_port.unwrap_or(51820);
-    let relay_endpoint = raw.relay_endpoint.unwrap_or_default();
-    let relay_mesh_ip = match raw.relay_mesh_ip {
+    let wg_interface = raw.wg_interface.unwrap_or_else(|| "wg0".into());
+    let wg_listen_port = raw.wg_listen_port.unwrap_or(51820);
+    let wg_endpoint_host = raw.wg_endpoint_host.unwrap_or_default();
+    let wg_mesh_ip = match raw.wg_mesh_ip {
         Some(s) => {
             let ip: Ipv4Addr = s
                 .parse()
-                .map_err(|_| ConfigError::InvalidRelayMeshIp(s.clone()))?;
+                .map_err(|_| ConfigError::InvalidWgMeshIp(s.clone()))?;
             if !ipv4_in_cidr(ip, network_addr, prefix_bits) {
-                return Err(ConfigError::InvalidRelayMeshIp(s));
+                return Err(ConfigError::InvalidWgMeshIp(s));
             }
             s
         }
@@ -124,10 +121,6 @@ fn from_raw(raw: Raw) -> Result<Config, ConfigError> {
         }
     };
 
-    if relay_enabled && relay_endpoint.is_empty() {
-        return Err(ConfigError::RelayMissingEndpoint);
-    }
-
     Ok(Config {
         listen_addr: raw.listen_addr.unwrap_or_else(|| ":8443".into()),
         tls_cert: raw.tls_cert.filter(|s| !s.is_empty()),
@@ -136,12 +129,11 @@ fn from_raw(raw: Raw) -> Result<Config, ConfigError> {
         state_path,
         authorized_signers,
         peer_ttl,
-        relay_enabled,
-        relay_ssh_key,
-        relay_interface,
-        relay_listen_port,
-        relay_endpoint,
-        relay_mesh_ip,
+        wg_ssh_key,
+        wg_interface,
+        wg_listen_port,
+        wg_endpoint_host,
+        wg_mesh_ip,
         network_addr,
         prefix_bits,
     })
@@ -177,49 +169,49 @@ mod tests {
     }
 
     #[test]
-    fn relay_default_true_when_absent() {
-        let raw: Raw = serde_json::from_str(
-            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a","relay_endpoint":"x:1"}"#,
-        )
-        .unwrap();
-        let cfg = from_raw(raw).unwrap();
-        assert!(cfg.relay_enabled);
-    }
-
-    #[test]
-    fn relay_false_when_explicit() {
-        let raw: Raw = serde_json::from_str(
-            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a","relay_enabled":false}"#,
-        )
-        .unwrap();
-        let cfg = from_raw(raw).unwrap();
-        assert!(!cfg.relay_enabled);
-    }
-
-    #[test]
-    fn relay_endpoint_required_when_enabled() {
+    fn endpoint_host_optional_and_empty_by_default() {
         let raw: Raw = serde_json::from_str(
             r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a"}"#,
         )
         .unwrap();
-        let r = from_raw(raw);
-        assert!(matches!(r, Err(ConfigError::RelayMissingEndpoint)));
+        let cfg = from_raw(raw).unwrap();
+        assert!(cfg.wg_endpoint_host.is_empty());
     }
 
     #[test]
-    fn default_relay_mesh_ip_is_first_usable() {
+    fn endpoint_host_passed_through_when_set() {
         let raw: Raw = serde_json::from_str(
-            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a","relay_endpoint":"x:1"}"#,
+            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a","wg_endpoint_host":"wg.example.com"}"#,
         )
         .unwrap();
         let cfg = from_raw(raw).unwrap();
-        assert_eq!(cfg.relay_mesh_ip, "10.42.0.1");
+        assert_eq!(cfg.wg_endpoint_host, "wg.example.com");
+    }
+
+    #[test]
+    fn default_wg_listen_port_is_51820() {
+        let raw: Raw = serde_json::from_str(
+            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a"}"#,
+        )
+        .unwrap();
+        let cfg = from_raw(raw).unwrap();
+        assert_eq!(cfg.wg_listen_port, 51820);
+    }
+
+    #[test]
+    fn default_wg_mesh_ip_is_first_usable() {
+        let raw: Raw = serde_json::from_str(
+            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a"}"#,
+        )
+        .unwrap();
+        let cfg = from_raw(raw).unwrap();
+        assert_eq!(cfg.wg_mesh_ip, "10.42.0.1");
     }
 
     #[test]
     fn listen_addr_shorthand_normalizes() {
         let raw: Raw = serde_json::from_str(
-            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a","relay_enabled":false,"listen_addr":":8443"}"#,
+            r#"{"mesh_cidr":"10.42.0.0/16","state_path":"/tmp/s","authorized_signers":"/tmp/a","listen_addr":":8443"}"#,
         )
         .unwrap();
         let cfg = from_raw(raw).unwrap();

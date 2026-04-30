@@ -229,20 +229,16 @@ impl ProbeManager {
         let mut summary = ReconcileSummary::default();
 
         if let Some(r) = relay {
-            if !r.wg_public_key.is_empty() && !r.mesh_cidr.is_empty() {
+            if !r.wg_public_key.is_empty() && !r.mesh_cidr.is_empty() && !r.host.is_empty() {
                 specs.push(PeerSpec {
                     pub_key_b64: r.wg_public_key.clone(),
-                    endpoint: if r.endpoint.is_empty() {
-                        None
-                    } else {
-                        Some(r.endpoint.clone())
-                    },
+                    endpoint: Some(format_wg_endpoint(&r.host, r.port)),
                     allowed_ips: vec![r.mesh_cidr.clone()],
                     keepalive_secs: Some(self.tunables.keepalive.as_secs() as u32),
                 });
                 summary.has_relay = true;
             } else {
-                debug!("relay info missing fields; skipping");
+                debug!("relay info incomplete; skipping");
             }
         }
 
@@ -320,6 +316,18 @@ fn duration_mul_f64(d: Duration, m: f64) -> Duration {
     Duration::from_secs_f64(secs)
 }
 
+/// Format a host + port pair into a `wg` config Endpoint value:
+/// - hostnames / IPv4: `host:port`
+/// - already-bracketed IPv6: `[::1]:port` (host kept as-is)
+/// - raw IPv6 (contains `:`, no brackets): `[host]:port`
+pub(crate) fn format_wg_endpoint(host: &str, port: u16) -> String {
+    if host.starts_with('[') || !host.contains(':') {
+        format!("{host}:{port}")
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,7 +336,8 @@ mod tests {
     fn fake_relay() -> api::Relay {
         api::Relay {
             wg_public_key: "RELAY-PUB".into(),
-            endpoint: "203.0.113.1:51820".into(),
+            host: "203.0.113.1".into(),
+            port: 51820,
             mesh_ip: "10.42.0.1".into(),
             mesh_cidr: "10.42.0.0/16".into(),
         }
