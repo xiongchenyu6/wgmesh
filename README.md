@@ -182,32 +182,16 @@ ssh-keyscan some.nixos.host | nix run github:xiongchenyu6/wgmesh#ssh-to-wg
 # → vknTxwj0J8f14zUlzjQxUJoiVAOuEdDgeMVORQT24yE=
 ```
 
-### Test locally without NixOS
+### Verify without deploying
 
-If you don't have a NixOS host handy and want to drive the coord with two
-synthetic identities, generate a pair of throwaway keys for the smoketest:
+Want to confirm everything compiles and the protocol works before pointing
+at production hosts? Run the workspace tests — they cover signing, key
+derivation, the probe state machine, and a real coord-server round-trip
+(register → /peers → re-register) end-to-end:
 
 ```sh
-git clone https://github.com/xiongchenyu6/wgmesh
-cd wgmesh/rust && cargo build --release && cd ..
-
-ssh-keygen -t ed25519 -N '' -f /tmp/host_a -C node-a
-ssh-keygen -t ed25519 -N '' -f /tmp/host_b -C node-b
-{ ssh-keygen -y -f /tmp/host_a; ssh-keygen -y -f /tmp/host_b; } > /tmp/auth
-
-cat > /tmp/coord.json <<'EOF'
-{ "listen_addr": "127.0.0.1:8443", "mesh_cidr": "10.42.0.0/16",
-  "state_path": "/tmp/state.json", "authorized_signers": "/tmp/auth",
-  "peer_ttl_seconds": 600, "relay_enabled": false }
-EOF
-
-./rust/target/release/wgmesh-coord -c /tmp/coord.json &
-./rust/target/release/wgmesh-smoketest --key /tmp/host_a --base http://127.0.0.1:8443
-./rust/target/release/wgmesh-smoketest --key /tmp/host_b --base http://127.0.0.1:8443
+cd rust && cargo test --workspace        # 44 tests pass
 ```
-
-Each node gets a stable `10.42.0.x` mesh IP and discovers the other via
-`/peers`. No kernel WireGuard required while `relay_enabled=false`.
 
 ---
 

@@ -167,32 +167,15 @@ ssh-keyscan some.nixos.host | nix run github:xiongchenyu6/wgmesh#ssh-to-wg
 # → vknTxwj0J8f14zUlzjQxUJoiVAOuEdDgeMVORQT24yE=
 ```
 
-### 不在 NixOS 上本地试一下
+### 不部署也想验证一下
 
-如果手边没有 NixOS 主机，又想用两个虚构的身份打通协调器，
-可以临时生成两把测试用 key 喂给 smoketest：
+想在指向真实主机之前先确认能编、协议没问题？跑 workspace 测试就够了——
+覆盖签名、密钥推导、探测状态机，以及一次 coord 服务端的真实注册→`/peers`
+→重注册端到端流程：
 
 ```sh
-git clone https://github.com/xiongchenyu6/wgmesh
-cd wgmesh/rust && cargo build --release && cd ..
-
-ssh-keygen -t ed25519 -N '' -f /tmp/host_a -C node-a
-ssh-keygen -t ed25519 -N '' -f /tmp/host_b -C node-b
-{ ssh-keygen -y -f /tmp/host_a; ssh-keygen -y -f /tmp/host_b; } > /tmp/auth
-
-cat > /tmp/coord.json <<'EOF'
-{ "listen_addr": "127.0.0.1:8443", "mesh_cidr": "10.42.0.0/16",
-  "state_path": "/tmp/state.json", "authorized_signers": "/tmp/auth",
-  "peer_ttl_seconds": 600, "relay_enabled": false }
-EOF
-
-./rust/target/release/wgmesh-coord -c /tmp/coord.json &
-./rust/target/release/wgmesh-smoketest --key /tmp/host_a --base http://127.0.0.1:8443
-./rust/target/release/wgmesh-smoketest --key /tmp/host_b --base http://127.0.0.1:8443
+cd rust && cargo test --workspace        # 44 个测试通过
 ```
-
-两个节点各自分到稳定的 `10.42.0.x` mesh IP，并通过 `/peers` 互相发现。
-设 `relay_enabled=false` 时无需内核态 WireGuard 也能跑。
 
 ---
 
