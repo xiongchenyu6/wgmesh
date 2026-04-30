@@ -1,0 +1,11 @@
+# wgmesh authorized_signers — one OpenSSH ed25519 public key per line.
+# The trailing comment is informational (typically the host's hostname) and
+# is shown in coord logs but not used for authentication.
+#
+# To extract a public key from a host SSH key:
+#     ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key
+#
+# Reload after changes: systemctl reload wgmesh-coord  (sends SIGHUP)
+
+# ssh-ed25519 AAAAC3Nza...example1... node-a.example.com
+# ssh-ed25519 AAAAC3Nza...example2... node-b.example.com

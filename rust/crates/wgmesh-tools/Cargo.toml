@@ -1,0 +1,26 @@
+[package]
+name = "wgmesh-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Developer tools: ssh-to-wg key derivation, smoketest client."
+
+[[bin]]
+name = "ssh-to-wg"
+path = "src/bin/ssh_to_wg.rs"
+
+[[bin]]
+name = "wgmesh-smoketest"
+path = "src/bin/smoketest.rs"
+
+[dependencies]
+wgmesh-core.workspace = true
+
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+ed25519-dalek.workspace = true
+chrono.workspace = true

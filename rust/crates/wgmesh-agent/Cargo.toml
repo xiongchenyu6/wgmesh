@@ -1,0 +1,37 @@
+[package]
+name = "wgmesh-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wgmesh node agent: registers with coord, drives probe-promote-demote on wg0."
+
+[lib]
+name = "wgmesh_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wgmesh-agent"
+path = "src/main.rs"
+
+[dependencies]
+wgmesh-core.workspace = true
+wgmesh-wglink = { path = "../wgmesh-wglink" }
+
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+ed25519-dalek.workspace = true
+
+ureq.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+if-addrs = "0.13"

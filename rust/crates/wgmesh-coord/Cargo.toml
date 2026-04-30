@@ -1,0 +1,42 @@
+[package]
+name = "wgmesh-coord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wgmesh coordinator: HTTP API + relay hub."
+
+[lib]
+name = "wgmesh_coord"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wgmesh-coord"
+path = "src/main.rs"
+
+[dependencies]
+wgmesh-core.workspace = true
+wgmesh-wglink = { path = "../wgmesh-wglink" }
+
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "fs", "time", "signal"] }
+axum.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = "2"
+ssh-key = { version = "0.6", features = ["ed25519"] }
+rand = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

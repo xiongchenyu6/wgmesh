@@ -1,0 +1,16 @@
+{
+  "listen_addr": ":8443",
+  "tls_cert": "",
+  "tls_key": "",
+  "mesh_cidr": "10.42.0.0/16",
+  "state_path": "/var/lib/wgmesh-coord/state.json",
+  "authorized_signers": "/etc/wgmesh/authorized_signers",
+  "peer_ttl_seconds": 600,
+
+  "relay_enabled": true,
+  "relay_ssh_key": "/etc/ssh/ssh_host_ed25519_key",
+  "relay_interface": "wg0",
+  "relay_listen_port": 51820,
+  "relay_endpoint": "vps.example.com:51820",
+  "relay_mesh_ip": "10.42.0.1"
+}
