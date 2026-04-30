@@ -16,6 +16,7 @@ chrono.workspace = true
 
 ed25519-dalek.workspace = true
 x25519-dalek = { workspace = true, features = ["static_secrets"] }
+curve25519-dalek = "4"
 sha2.workspace = true
 rand.workspace = true
 ssh-key.workspace = true

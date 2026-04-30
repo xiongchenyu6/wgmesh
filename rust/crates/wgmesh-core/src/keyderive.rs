@@ -7,9 +7,10 @@
 //! key. The transformation matches the Go implementation in
 //! `internal/keyderive/keyderive.go` byte-for-byte.
 
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha512};
-use ssh_key::{Algorithm, PrivateKey};
+use ssh_key::{Algorithm, PrivateKey, PublicKey};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
@@ -27,6 +28,8 @@ pub enum KeyDeriveError {
     NotEd25519(String),
     #[error("encrypted SSH keys are not supported (decrypt with `ssh-keygen -p` first)")]
     Encrypted,
+    #[error("invalid ed25519 public key (not a valid Edwards point)")]
+    InvalidPublicKey,
 }
 
 /// The set of derived material an agent or coord needs from one SSH host key.
@@ -93,6 +96,32 @@ pub fn wg_from_ssh_file(path: &str) -> Result<WgKeys, KeyDeriveError> {
         })?)
 }
 
+/// Convert a 32-byte ed25519 *public* key to the equivalent X25519 (WireGuard)
+/// public key. Mirrors libsodium's `crypto_sign_ed25519_pk_to_curve25519`:
+/// decompress the Edwards point, then map birationally onto the Montgomery
+/// curve. Useful for converting `ssh-keyscan` output / `authorized_keys`
+/// lines without needing the matching private key.
+pub fn wg_pub_from_ed25519_pub(ed_pub: &[u8; 32]) -> Result<[u8; 32], KeyDeriveError> {
+    let edwards = CompressedEdwardsY(*ed_pub)
+        .decompress()
+        .ok_or(KeyDeriveError::InvalidPublicKey)?;
+    Ok(edwards.to_montgomery().to_bytes())
+}
+
+/// Parse one `ssh-ed25519 AAAA... [comment]` line and return the WG pubkey.
+/// Convenience for the `ssh-to-wg` CLI's stdin mode.
+pub fn wg_pub_from_authorized_line(line: &str) -> Result<[u8; 32], KeyDeriveError> {
+    let pk = PublicKey::from_openssh(line.trim())?;
+    if pk.algorithm() != Algorithm::Ed25519 {
+        return Err(KeyDeriveError::NotEd25519(pk.algorithm().to_string()));
+    }
+    let ed = pk
+        .key_data()
+        .ed25519()
+        .ok_or_else(|| KeyDeriveError::NotEd25519("missing".into()))?;
+    wg_pub_from_ed25519_pub(&ed.0)
+}
+
 /// The core algorithm — exposed so unit tests can pin a known seed.
 ///
 /// libsodium spec: `priv = clamp(sha512(seed)[..32])`, `pub = priv * base`.
@@ -153,5 +182,20 @@ mod tests {
         let wg = derive_wg_from_seed(&seed);
         assert_eq!(wg.pub_key.len(), 32);
         assert_eq!(verifying.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn pub_conversion_matches_priv_derivation() {
+        // Converting an ed25519 *public* key to X25519 should produce the same
+        // 32 bytes as deriving WG keys from the matching seed and taking the
+        // public part.  Edwards↔Montgomery is birational, so this round-trip
+        // holds for every valid ed25519 key.
+        for seed_byte in [0u8, 1, 7, 42, 99, 200, 255] {
+            let seed = [seed_byte; 32];
+            let ed_pub = *SigningKey::from_bytes(&seed).verifying_key().as_bytes();
+            let from_priv = derive_wg_from_seed(&seed).pub_key;
+            let from_pub = wg_pub_from_ed25519_pub(&ed_pub).unwrap();
+            assert_eq!(from_priv, from_pub, "seed_byte={seed_byte}");
+        }
     }
 }
