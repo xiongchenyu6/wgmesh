@@ -403,6 +403,9 @@ profile is `opt-level="z"`, `lto="fat"`, `codegen-units=1`, `strip=true`,
 
 ## Protocol
 
+Plain HTTP + JSON, ed25519-signed in headers. See
+[Trade-offs](#trade-offs-and-non-goals) for why not gRPC.
+
 Every `/register` and `/peers` request carries three headers:
 
 | Header              | Value                                          |
@@ -530,6 +533,13 @@ so a successful build means a complete artifact set.
   transport are fine).
 - **Not a Tailscale replacement.** No MagicDNS, no SSH-via-tailscale, no
   app connector. Just a mesh.
+- **HTTP + JSON, not gRPC.** Coord and agent live in the same Rust
+  workspace and share `wgmesh-core::api` literally, so there's no
+  cross-language type-drift problem for protobuf to solve. Agents poll
+  once every 30 s — no streaming or multiplexing needs. Keeping the wire
+  `curl`-debuggable and the agent under 3 MB was worth more than gRPC's
+  nominal modernity (a tonic-based stack would push the agent past 5 MB
+  and pull `protoc` into the build closure).
 
 ---
 

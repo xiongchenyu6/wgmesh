@@ -372,6 +372,9 @@ Netmaker 是带 Web UI 的 Go 自托管 mesh，也提供托管服务的味道。
 
 ## 协议
 
+普通的 HTTP + JSON，ed25519 签名走 header。为什么没用 gRPC，见
+[取舍](#取舍--不做的事)。
+
 `/register` 和 `/peers` 都带三个签名头：
 
 | Header              | 内容                                           |
@@ -493,6 +496,12 @@ flake 的 `postInstall` 会断言每个预期的二进制都进了 `$out/bin/`�
 - **只有 IPv4 mesh**（覆盖网；下层 WireGuard 走 IPv6 端点没问题）。
 - **不是 Tailscale 替代品。** 没有 MagicDNS、没有 SSH-via-tailscale、
   没有 app connector。就是一张 mesh。
+- **HTTP + JSON，不是 gRPC。** Coord 和 agent 在同一个 Rust workspace，
+  直接共享 `wgmesh-core::api` 的类型定义——根本不存在跨语言类型漂移问题
+  等 protobuf 来解决。Agent 每 30 秒 poll 一次，没有流式或多路复用的需要。
+  让协议能用 `curl` 调试、agent 二进制控制在 3 MB 以内，比 gRPC 的
+  "现代"气息值钱（换成 tonic 栈，agent 会涨到 5 MB+，构建闭包还得拖
+  `protoc` 进来）。
 
 ---
 
