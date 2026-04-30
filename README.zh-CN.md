@@ -30,9 +30,11 @@ wgmesh 的设计目标是 **NixOS 下最快速度起一张网**。其它特性�
   推导出来（用 libsodium 的 `crypto_sign_ed25519_sk_to_curve25519` 算法）。
   系统已经有的 SSH host key **就是** WireGuard 身份。和 sops-nix / agenix
   天然契合，因为没有任何额外的东西需要加密。
-- **接入 = 追加一行。** 装好新节点 → 一行命令拿到它的 `ssh-ed25519 …` 公钥
-  （`ssh-keygen -y`）→ 追加到协调器的 `authorized_signers` →
-  `systemctl reload wgmesh-coord`。没有邀请令牌，没有过期凭证，没有 UI 流程。
+- **接入 = 改 flake。** 装好新节点 → 一行命令拿到它的 `ssh-ed25519 …` 公钥
+  （`ssh node 'cat /etc/ssh/ssh_host_ed25519_key.pub'`）→ 加到协调器配置的
+  `services.wgmesh-coord.authorizedSigners` 列表里 → `nixos-rebuild switch`。
+  模块自动重写允许列表文件、自动 SIGHUP coord（`reloadTriggers`）。允许接入
+  的节点列表躺在 git 里，不是命令式 side-effect 留下的状态。
 - **协调器同时充当中继。** 直接 P2P 能通就用直连；通不了的流量自动走协调器的
   wg0 中继过去。无需运维 DERP 之类的中继基础设施。
 - **够小。** Agent 二进制 2.7 MB，空载时 RSS 约 3.5 MB。在 128 MB
@@ -117,10 +119,13 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
   imports = [ wgmesh.nixosModules.coordinator ];
   services.openssh.enable = true;        # 提供 host key
   services.wgmesh-coord = {
-    enable                = true;
-    meshCidr              = "10.42.0.0/16";
-    authorizedSignersPath = "/etc/wgmesh/authorized_signers";
-    openFirewall          = true;
+    enable    = true;
+    meshCidr  = "10.42.0.0/16";
+    authorizedSigners = [
+      "ssh-ed25519 AAAA... node-a"       # 每行一个节点
+      "ssh-ed25519 AAAA... node-b"
+    ];
+    openFirewall = true;
     # 不用配 endpoint：agent 已经知道 coord 的 hostname
     # （它就是 agent 自己 services.wgmesh.coordinator URL 里的 host），
     # WG 端口由 coord 通过 /peers 广播（默认 51820）。
@@ -144,16 +149,30 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
 }
 ```
 
-接入新节点是一条管道命令——读现成的 host key，啥都不生成：
+接入新节点是声明式两步走：
 
 ```sh
-# 在新节点上读取已有的公钥，追加到协调器的允许列表
-ssh node-x 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers \
-               && systemctl reload wgmesh-coord'
+# 1. 拿到新节点已有的公钥（只读）。
+ssh node-x cat /etc/ssh/ssh_host_ed25519_key.pub
 ```
 
-新节点会在下一次 reconcile tick 自动注册，并被网内其它节点发现。
+```nix
+# 2. 把这一行加到 coord 的 NixOS 配置里，rebuild：
+services.wgmesh-coord.authorizedSigners = [
+  "ssh-ed25519 AAAA... node-a"
+  "ssh-ed25519 AAAA... node-b"
+  "ssh-ed25519 AAAA... node-x"   # ← 新加的
+];
+```
+
+```sh
+nixos-rebuild switch --flake .#coord --target-host coord.example.com
+```
+
+模块自动重渲染 `/etc/wgmesh/authorized_signers`、自动 SIGHUP coord
+（靠 `reloadTriggers`）；新节点在下一次 reconcile tick 自动注册。
+允许接入的节点列表现在是 git 里的一行，而不是命令式 shell 管道留下的
+不可追溯状态。
 
 ### 单独验证转换（无需 NixOS、无需任何配置）
 
@@ -212,10 +231,14 @@ cd rust && cargo test --workspace        # 44 个测试通过
           { networking.hostName = "coord";
             services.openssh.enable = true;
             services.wgmesh-coord = {
-              enable                = true;
-              meshCidr              = "10.42.0.0/16";
-              authorizedSignersPath = "/etc/wgmesh/authorized_signers";
-              openFirewall          = true;
+              enable    = true;
+              meshCidr  = "10.42.0.0/16";
+              authorizedSigners = [
+                "ssh-ed25519 AAAA... node-a"
+                "ssh-ed25519 AAAA... node-b"
+                "ssh-ed25519 AAAA... node-c"
+              ];
+              openFirewall = true;
             };
             services.coturn = {
               enable = true; listening-port = 3478;
@@ -235,30 +258,30 @@ cd rust && cargo test --workspace        # 44 个测试通过
 }
 ```
 
-整网上线只要：
+整网上线流程：
 
 ```sh
-# 1. 部署。每台机器 nixos-rebuild 时 wgmesh-{coord,agent} 会自动起来。
-nixos-rebuild switch --flake .#coord  --target-host coord.example.com
+# 1. 先部署 agent，让每台主机的 sshd 自动生成 host key。
 nixos-rebuild switch --flake .#node-a --target-host node-a.example.com
 nixos-rebuild switch --flake .#node-b --target-host node-b.example.com
 nixos-rebuild switch --flake .#node-c --target-host node-c.example.com
 
-# 2. 把每个节点的 SSH 公钥追加到协调器的允许列表。
-ssh node-a 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers'
-ssh node-b 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers'
-ssh node-c 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers'
-ssh coord 'systemctl reload wgmesh-coord'
+# 2. 读出每个节点的公钥（只读），粘到 coord 配置的
+#    `authorizedSigners` 列表里。git commit。
+for h in node-a node-b node-c; do ssh $h cat /etc/ssh/ssh_host_ed25519_key.pub; done
+$EDITOR flake.nix   # 粘进去，提交。
+
+# 3. 部署 coord。模块自动渲染 authorized_signers，
+#    reloadTriggers 在 activation 时触发服务 reload。
+nixos-rebuild switch --flake .#coord --target-host coord.example.com
 ```
 
 约 30 秒后 agent 完成首次 reconcile，内核 WireGuard 接口起来，
 `node-a` 通过 `10.42.0.x` 就能 ping 到 `node-b`。
 没有交互式 `tailscale up`、没有邀请文件分发、没有 UI 操作。
 
-之后加节点就两步：`nixos-rebuild` 然后追加公钥 + reload。
+之后加节点：`nixos-rebuild` 装好节点，把它的公钥加到
+`authorizedSigners`，再 `nixos-rebuild` 一下 coord 即可。
 **整套系统没有别的状态。** 协调器 VPS 挂了？从备份还原
 `/var/lib/wgmesh-coord/state.json`，mesh IP 自动还是原来的。
 

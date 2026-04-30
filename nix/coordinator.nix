@@ -22,6 +22,18 @@ let
   };
   configFile = pkgs.writeText "wgmesh-coord.json" (builtins.toJSON configAttrs);
 
+  # Declarative allowlist: inline strings + files, both optional. Combined
+  # contents are rendered to authorizedSignersPath via environment.etc; the
+  # systemd service's reloadTriggers carries the hash so changes auto-SIGHUP.
+  fromList  = lib.concatStringsSep "\n" cfg.authorizedSigners;
+  fromFiles = lib.concatMapStringsSep "\n"
+    (f: lib.removeSuffix "\n" (builtins.readFile f))
+    cfg.authorizedSignerFiles;
+  renderedSigners =
+    let parts = lib.filter (s: s != "") [ fromList fromFiles ];
+    in if parts == [] then "" else (lib.concatStringsSep "\n" parts) + "\n";
+  hasInlineSigners = cfg.authorizedSigners != [] || cfg.authorizedSignerFiles != [];
+
   listenPortFromAddr =
     let parts = lib.splitString ":" cfg.listenAddr;
     in lib.toInt (lib.last parts);
@@ -43,10 +55,32 @@ in
       description = "IPv4 CIDR for mesh IP allocation.";
     };
 
-    authorizedSignersPath = lib.mkOption {
-      type = lib.types.path;
-      example = "/etc/wgmesh/authorized_signers";
-      description = "OpenSSH ed25519 pubkey allowlist; SIGHUP reloads.";
+    authorizedSigners = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      example = [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...AAA node-a"
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...BBB node-b"
+      ];
+      description = ''
+        Inline OpenSSH ed25519 public key lines authorizing nodes to join
+        the mesh. Rendered to `authorizedSignersPath` at activation time.
+        Changing this list automatically reloads the coord (SIGHUP via
+        `systemd.services.wgmesh-coord.reloadTriggers`); no manual
+        `systemctl reload` step.
+      '';
+    };
+
+    authorizedSignerFiles = lib.mkOption {
+      type = lib.types.listOf lib.types.path;
+      default = [];
+      example = lib.literalExpression ''[ ./pubkeys/node-a.pub ./pubkeys/node-b.pub ]'';
+      description = ''
+        Paths to OpenSSH `.pub` files; concatenated with `authorizedSigners`
+        into the rendered allowlist. Useful when keys live in their own
+        per-node files (e.g. checked into the flake from each host's first
+        boot).
+      '';
     };
 
     ## Common ------------------------------------------------------------------
@@ -64,6 +98,16 @@ in
     };
 
     ## Advanced (sensible defaults) -------------------------------------------
+
+    authorizedSignersPath = lib.mkOption {
+      type = lib.types.path;
+      default = "/etc/wgmesh/authorized_signers";
+      description = ''
+        Path to the allowlist file. Auto-rendered from `authorizedSigners`
+        / `authorizedSignerFiles` when either is non-empty; otherwise place
+        the file here yourself (e.g. via sops-nix / agenix).
+      '';
+    };
 
     endpointHost = lib.mkOption {
       type = lib.types.str;
@@ -135,6 +179,27 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !hasInlineSigners
+          || cfg.authorizedSignersPath == "/etc/wgmesh/authorized_signers";
+        message = ''
+          services.wgmesh-coord.authorizedSigners (or authorizedSignerFiles)
+          render to /etc/wgmesh/authorized_signers. Either keep the default
+          authorizedSignersPath, or clear the inline lists and manage the
+          file yourself (e.g. via sops-nix).
+        '';
+      }
+    ];
+
+    # Declarative allowlist → /etc/wgmesh/authorized_signers.
+    environment.etc = lib.mkIf hasInlineSigners {
+      "wgmesh/authorized_signers" = {
+        mode = "0644";
+        text = renderedSigners;
+      };
+    };
+
     systemd.tmpfiles.rules = [
       "d ${cfg.stateDir} 0700 root root -"
     ];
@@ -148,6 +213,10 @@ in
       after = [ "network-online.target" "sshd.service" ];
       wants = [ "network-online.target" ];
       path = [ pkgs.iproute2 pkgs.wireguard-tools pkgs.coreutils ];
+
+      # Rebuild + activate → if the JSON config or the rendered allowlist
+      # changed, systemd fires ExecReload (SIGHUP). No manual reload step.
+      reloadTriggers = [ configFile renderedSigners ];
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/wgmesh-coord -c ${configFile}";

@@ -36,10 +36,12 @@ Every other property follows from that.
   uses (`crypto_sign_ed25519_sk_to_curve25519`). The host key your NixOS
   install already has *is* the WireGuard identity. Composes naturally with
   sops-nix / agenix because there's nothing extra to encrypt.
-- **Onboarding = appending a line.** Bring up a new node → grab its
-  `ssh-ed25519 …` pubkey (one command, `ssh-keygen -y`) → append to coord's
-  `authorized_signers` → `systemctl reload wgmesh-coord`. No invite tokens,
-  no expiring credentials, no UI flows.
+- **Onboarding = editing your flake.** Bring up a new node → grab its
+  `ssh-ed25519 …` pubkey (`ssh node 'cat /etc/ssh/ssh_host_ed25519_key.pub'`)
+  → add it to `services.wgmesh-coord.authorizedSigners` in the coord's
+  NixOS config → `nixos-rebuild switch`. The module re-renders the
+  allowlist file and SIGHUPs coord automatically (`reloadTriggers`). The
+  set of authorized nodes lives in git, not in untracked imperative state.
 - **Coord on a public VPS doubles as the relay.** Direct P2P is preferred
   and used when reachable; anything that can't go direct flows through the
   coordinator's wg0 transparently. No DERP infrastructure to operate.
@@ -129,10 +131,13 @@ live. Once a handshake lands, we promote to `/32` atomically.
   imports = [ wgmesh.nixosModules.coordinator ];
   services.openssh.enable = true;        # provides the host key
   services.wgmesh-coord = {
-    enable                = true;
-    meshCidr              = "10.42.0.0/16";
-    authorizedSignersPath = "/etc/wgmesh/authorized_signers";
-    openFirewall          = true;
+    enable    = true;
+    meshCidr  = "10.42.0.0/16";
+    authorizedSigners = [
+      "ssh-ed25519 AAAA... node-a"       # one line per node
+      "ssh-ed25519 AAAA... node-b"
+    ];
+    openFirewall = true;
     # No endpoint to configure: agents already know coord's hostname
     # (it's the host part of their `services.wgmesh.coordinator` URL),
     # and the WG port is published via /peers (default 51820).
@@ -156,18 +161,30 @@ live. Once a handshake lands, we promote to `/32` atomically.
 }
 ```
 
-Onboarding a new node is a single pipe — the host key is read from disk,
-nothing is generated:
+Onboarding a new node is two declarative steps:
 
 ```sh
-# read the existing public host key on the new node, append to coord's allowlist
-ssh node-x 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers \
-               && systemctl reload wgmesh-coord'
+# 1. Grab the new node's public host key (read-only).
+ssh node-x cat /etc/ssh/ssh_host_ed25519_key.pub
 ```
 
-The new node registers on its next reconcile tick and is reachable from the
-rest of the mesh.
+```nix
+# 2. Add the line to your coord's NixOS config and rebuild:
+services.wgmesh-coord.authorizedSigners = [
+  "ssh-ed25519 AAAA... node-a"
+  "ssh-ed25519 AAAA... node-b"
+  "ssh-ed25519 AAAA... node-x"   # ← new
+];
+```
+
+```sh
+nixos-rebuild switch --flake .#coord --target-host coord.example.com
+```
+
+The module re-renders `/etc/wgmesh/authorized_signers` and SIGHUPs coord
+automatically (`reloadTriggers`); the new node registers on its next
+reconcile tick. The set of authorized nodes is now a line in git, not an
+untracked side-effect of a shell pipe.
 
 ### Try the conversion (no NixOS, no setup)
 
@@ -228,10 +245,14 @@ flake. Here's a complete one-VPS-plus-N-agents setup:
           { networking.hostName = "coord";
             services.openssh.enable = true;
             services.wgmesh-coord = {
-              enable                = true;
-              meshCidr              = "10.42.0.0/16";
-              authorizedSignersPath = "/etc/wgmesh/authorized_signers";
-              openFirewall          = true;
+              enable    = true;
+              meshCidr  = "10.42.0.0/16";
+              authorizedSigners = [
+                "ssh-ed25519 AAAA... node-a"
+                "ssh-ed25519 AAAA... node-b"
+                "ssh-ed25519 AAAA... node-c"
+              ];
+              openFirewall = true;
             };
             services.coturn = {
               enable = true; listening-port = 3478;
@@ -251,23 +272,22 @@ flake. Here's a complete one-VPS-plus-N-agents setup:
 }
 ```
 
-To bring the whole mesh up:
+Bringing the whole mesh up:
 
 ```sh
-# 1. Deploy. Each host's NixOS rebuild starts wgmesh-{coord,agent}.
-nixos-rebuild switch --flake .#coord  --target-host coord.example.com
+# 1. Deploy the agents first so each host generates its SSH host key.
 nixos-rebuild switch --flake .#node-a --target-host node-a.example.com
 nixos-rebuild switch --flake .#node-b --target-host node-b.example.com
 nixos-rebuild switch --flake .#node-c --target-host node-c.example.com
 
-# 2. Authorize each node on the coord (append SSH host pubkeys).
-ssh node-a 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers'
-ssh node-b 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers'
-ssh node-c 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
-  | ssh coord 'cat >> /etc/wgmesh/authorized_signers'
-ssh coord 'systemctl reload wgmesh-coord'
+# 2. Read each node's pubkey (read-only) and paste them into the
+#    coord config's `authorizedSigners` list. `git commit`.
+for h in node-a node-b node-c; do ssh $h cat /etc/ssh/ssh_host_ed25519_key.pub; done
+$EDITOR flake.nix   # paste the lines, commit, push
+
+# 3. Deploy the coord. The module renders authorized_signers and the
+#    service reloads on activation thanks to reloadTriggers.
+nixos-rebuild switch --flake .#coord --target-host coord.example.com
 ```
 
 Within ~30 s the agents finish their first reconcile tick, the kernel
@@ -275,9 +295,10 @@ WireGuard interfaces come up, and `node-a` can ping `node-b` over
 `10.42.0.x`. No interactive `tailscale up`, no invitation file
 distribution, no admin UI.
 
-Adding a new node later is exactly two commands: `nixos-rebuild` it, then
-append + reload. **There is no other state.** Lose the coord VPS? Restore
-`/var/lib/wgmesh-coord/state.json` from backup; mesh IPs come back stable.
+Adding a new node later: `nixos-rebuild` the node, append a line to
+`authorizedSigners`, `nixos-rebuild` the coord. **There is no other
+state.** Lose the coord VPS? Restore `/var/lib/wgmesh-coord/state.json`
+from backup; mesh IPs come back stable.
 
 ---
 
