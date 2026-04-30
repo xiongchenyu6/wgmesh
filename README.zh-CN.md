@@ -117,14 +117,11 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
   imports = [ wgmesh.nixosModules.coordinator ];
   services.openssh.enable = true;        # 提供 host key
   services.wgmesh-coord = {
-    enable = true;
-    meshCidr = "10.42.0.0/16";
+    enable                = true;
+    meshCidr              = "10.42.0.0/16";
+    endpoint              = "vps.example.com:51820";   # 公网 WG UDP host:port
     authorizedSignersPath = "/etc/wgmesh/authorized_signers";
-    openFirewall = true;
-    relay = {
-      enable   = true;
-      endpoint = "vps.example.com:51820";  # 必填：agent 用来连中继的 UDP host:port
-    };
+    openFirewall          = true;
   };
   services.coturn = { enable = true; listening-port = 3478; no-tls = true;
     no-dtls = true; use-auth-secret = false; no-auth = true; };
@@ -215,9 +212,9 @@ cd rust && cargo test --workspace        # 44 个测试通过
             services.wgmesh-coord = {
               enable                = true;
               meshCidr              = "10.42.0.0/16";
+              endpoint              = "vps.example.com:51820";
               authorizedSignersPath = "/etc/wgmesh/authorized_signers";
               openFirewall          = true;
-              relay.endpoint        = "vps.example.com:51820";
             };
             services.coturn = {
               enable = true; listening-port = 3478;

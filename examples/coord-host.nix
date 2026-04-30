@@ -2,7 +2,7 @@
 #
 # Usage in your flake:
 #
-#   inputs.wgmesh.url = "github:freemanxiong/wgmesh";   # adjust
+#   inputs.wgmesh.url = "github:xiongchenyu6/wgmesh";
 #
 #   outputs = { self, nixpkgs, wgmesh, ... }: {
 #     nixosConfigurations.coord = nixpkgs.lib.nixosSystem {
@@ -15,20 +15,19 @@
 #   };
 
 { pkgs, ... }: {
-  services.openssh.enable = true;     # for /etc/ssh/ssh_host_ed25519_key (used by relay)
+  # The coordinator's WireGuard keypair is derived from this host key —
+  # services.openssh provides /etc/ssh/ssh_host_ed25519_key by default.
+  services.openssh.enable = true;
 
   services.wgmesh-coord = {
-    enable = true;
-    listenAddr = ":8443";
-    meshCidr = "10.42.0.0/16";
+    enable                = true;
+    meshCidr              = "10.42.0.0/16";
+    endpoint              = "vps.example.com:51820";   # public WG UDP host:port
     authorizedSignersPath = "/etc/wgmesh/authorized_signers";
-    openFirewall = true;
-
-    relay = {
-      enable = true;
-      endpoint = "vps.example.com:51820";   # public host:port; agents connect here for the WG hub
-      # meshIP = "10.42.0.1";               # default = first usable in meshCidr
-    };
+    openFirewall          = true;
+    # meshIP             = "10.42.0.1";                 # default = first usable
+    # listenAddr         = ":8443";                     # HTTP API (default)
+    # wgListenPort       = 51820;                       # WG UDP port (default)
   };
 
   # Manage authorized_signers with sops-nix in real deployments.
