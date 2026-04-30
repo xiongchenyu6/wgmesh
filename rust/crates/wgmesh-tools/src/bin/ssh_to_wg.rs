@@ -1,48 +1,98 @@
-//! ssh-to-wg — same CLI shape as ssh-to-age.
+//! ssh-to-wg — same CLI as `ssh-to-age`.
 //!
-//! With a key file: derive both WireGuard private and public keys from an
-//! OpenSSH ed25519 *private* key.
+//! ```text
+//! Usage of ssh-to-wg:
+//!   -i string
+//!         Input path. Reads by default from standard input (default "-")
+//!   -o string
+//!         Output path. Prints by default to standard output (default "-")
+//!   -private-key
+//!         convert private key instead of public key
+//! ```
 //!
-//! With no key file: read SSH *public* keys from stdin (the format produced
-//! by `ssh-keyscan` or `~/.ssh/authorized_keys`) and emit the corresponding
-//! WireGuard public keys, one per line. Non-ed25519 keys are skipped with a
-//! diagnostic on stderr — same behavior as ssh-to-age.
+//! Default mode (public key): each input line is parsed as
+//! `ssh-keyscan` / `authorized_keys` output. Non-ed25519 keys are skipped
+//! with a stderr diagnostic. WG public keys are written, one per line.
+//!
+//! With `-private-key`: input must be an OpenSSH ed25519 PRIVATE key file
+//! (no passphrase). Output is two lines:
+//! ```text
+//! # public key: <wg-pub-base64>
+//! <wg-priv-base64>
+//! ```
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use clap::Parser;
-use std::io::BufRead;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::Path;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "ssh-to-wg",
-    about = "Derive WireGuard X25519 keys from OpenSSH ed25519 keys.",
-    long_about = "With a key file (positional or -i), prints the WG private and \
-public keys derived from an OpenSSH ed25519 *private* key.\n\nWith no \
-arguments, reads SSH *public* keys from stdin (ssh-keyscan / \
-authorized_keys format) and prints WG public keys, one per line. \
-Non-ed25519 keys are skipped with a stderr diagnostic."
-)]
-struct Args {
-    /// Path to an OpenSSH ed25519 private key (no passphrase).
-    key_path: Option<String>,
+const HELP: &str = "\
+Usage of ssh-to-wg:
+  -i string
+        Input path. Reads by default from standard input (default \"-\")
+  -o string
+        Output path. Prints by default to standard output (default \"-\")
+  -private-key
+        convert private key instead of public key
+";
 
-    /// Alias for the positional argument; matches `ssh-to-age -i <file>`.
-    #[arg(short = 'i', long = "identity")]
-    identity: Option<String>,
+#[derive(Debug)]
+struct CliArgs {
+    input: String,
+    output: String,
+    private_key: bool,
+}
+
+fn parse_cli<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs> {
+    let _prog = args.next();
+    let mut a = CliArgs {
+        input: "-".to_string(),
+        output: "-".to_string(),
+        private_key: false,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "-help" | "--help" => {
+                print!("{HELP}");
+                std::process::exit(0);
+            }
+            "-i" | "--input" => {
+                a.input = args
+                    .next()
+                    .ok_or_else(|| anyhow!("flag needs an argument: -i"))?;
+            }
+            // ssh-to-age also accepts -i=foo style; handle both
+            s if s.starts_with("-i=") => a.input = s[3..].to_string(),
+            s if s.starts_with("--input=") => a.input = s[8..].to_string(),
+            "-o" | "--output" => {
+                a.output = args
+                    .next()
+                    .ok_or_else(|| anyhow!("flag needs an argument: -o"))?;
+            }
+            s if s.starts_with("-o=") => a.output = s[3..].to_string(),
+            s if s.starts_with("--output=") => a.output = s[9..].to_string(),
+            "-private-key" | "--private-key" => a.private_key = true,
+            other => bail!("unknown argument: {other}\n\n{HELP}"),
+        }
+    }
+    Ok(a)
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    if let Some(p) = args.key_path.or(args.identity) {
-        let id = wgmesh_core::keyderive::identity_from_ssh_file(&p)?;
-        println!("private: {}", B64.encode(id.wg_priv));
-        println!("public:  {}", B64.encode(id.wg_pub));
-        return Ok(());
+    let args = parse_cli(std::env::args())?;
+    let mut out = open_writer(&args.output)?;
+    if args.private_key {
+        run_private(&args.input, out.as_mut())?;
+    } else {
+        run_public(&args.input, out.as_mut())?;
     }
+    out.flush()?;
+    Ok(())
+}
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
+fn run_public(input_path: &str, out: &mut dyn Write) -> Result<()> {
+    let reader = open_reader(input_path)?;
+    for line in reader.lines() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -59,19 +109,24 @@ fn main() -> Result<()> {
             continue;
         }
         match wgmesh_core::keyderive::wg_pub_from_authorized_line(&pubkey_line) {
-            Ok(wg_pub) => println!("{}", B64.encode(wg_pub)),
+            Ok(wg_pub) => writeln!(out, "{}", B64.encode(wg_pub))?,
             Err(e) => eprintln!("skipped key: {e}"),
         }
     }
     Ok(())
 }
 
-/// Strip the optional ssh-keyscan host/marker prefix and return
-/// (key_type, "<key_type> <base64> [comment]").
-///
-/// `ssh-keyscan` emits `host ssh-ed25519 AAAA…`; `authorized_keys` emits
-/// `[options] ssh-ed25519 AAAA… comment`. We find the first whitespace token
-/// that looks like an SSH key-type identifier and use that as the start.
+fn run_private(input_path: &str, out: &mut dyn Write) -> Result<()> {
+    let pem = read_all(input_path)?;
+    let id = wgmesh_core::keyderive::identity_from_pem(&pem)
+        .with_context(|| format!("parse private key from {input_path}"))?;
+    writeln!(out, "# public key: {}", B64.encode(id.wg_pub))?;
+    writeln!(out, "{}", B64.encode(id.wg_priv))?;
+    Ok(())
+}
+
+/// Strip optional ssh-keyscan host/marker prefix and return
+/// `(key_type, "<key_type> <base64> [comment]")`.
 fn pick_pubkey_part(line: &str) -> Option<(String, String)> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     for (i, tok) in toks.iter().enumerate() {
@@ -80,4 +135,84 @@ fn pick_pubkey_part(line: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+fn open_reader(path: &str) -> Result<Box<dyn BufRead>> {
+    if path == "-" {
+        Ok(Box::new(BufReader::new(io::stdin())))
+    } else {
+        let f = std::fs::File::open(Path::new(path))
+            .with_context(|| format!("open {path}"))?;
+        Ok(Box::new(BufReader::new(f)))
+    }
+}
+
+fn open_writer(path: &str) -> Result<Box<dyn Write>> {
+    if path == "-" {
+        Ok(Box::new(io::stdout()))
+    } else {
+        let f = std::fs::File::create(Path::new(path))
+            .with_context(|| format!("create {path}"))?;
+        Ok(Box::new(f))
+    }
+}
+
+fn read_all(path: &str) -> Result<Vec<u8>> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read(path).with_context(|| format!("read {path}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        std::iter::once("ssh-to-wg")
+            .chain(v.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn defaults() {
+        let a = parse_cli(args(&[]).into_iter()).unwrap();
+        assert_eq!(a.input, "-");
+        assert_eq!(a.output, "-");
+        assert!(!a.private_key);
+    }
+
+    #[test]
+    fn dash_i_separate() {
+        let a = parse_cli(args(&["-i", "/tmp/k"]).into_iter()).unwrap();
+        assert_eq!(a.input, "/tmp/k");
+    }
+
+    #[test]
+    fn dash_i_equals() {
+        let a = parse_cli(args(&["-i=/tmp/k"]).into_iter()).unwrap();
+        assert_eq!(a.input, "/tmp/k");
+    }
+
+    #[test]
+    fn private_key_single_dash() {
+        let a = parse_cli(args(&["-private-key"]).into_iter()).unwrap();
+        assert!(a.private_key);
+    }
+
+    #[test]
+    fn private_key_double_dash_also_works() {
+        let a = parse_cli(args(&["--private-key"]).into_iter()).unwrap();
+        assert!(a.private_key);
+    }
+
+    #[test]
+    fn unknown_arg_errors() {
+        let r = parse_cli(args(&["--bogus"]).into_iter());
+        assert!(r.is_err());
+    }
 }

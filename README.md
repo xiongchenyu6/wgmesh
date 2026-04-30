@@ -116,50 +116,26 @@ live. Once a handshake lands, we promote to `/32` atomically.
 
 ## Quick start
 
-### Run it locally in 30 seconds
+### NixOS: use the host key you already have
 
-```sh
-git clone https://github.com/<you>/wgmesh
-cd wgmesh/rust && cargo build --release
-cd ..
-
-ssh-keygen -t ed25519 -N '' -f /tmp/host_a -C node-a
-ssh-keygen -t ed25519 -N '' -f /tmp/host_b -C node-b
-{ ssh-keygen -y -f /tmp/host_a; ssh-keygen -y -f /tmp/host_b; } > /tmp/auth
-
-cat > /tmp/coord.json <<'EOF'
-{
-  "listen_addr":        "127.0.0.1:8443",
-  "mesh_cidr":          "10.42.0.0/16",
-  "state_path":         "/tmp/state.json",
-  "authorized_signers": "/tmp/auth",
-  "peer_ttl_seconds":   600,
-  "relay_enabled":      false
-}
-EOF
-
-./rust/target/release/wgmesh-coord -c /tmp/coord.json &
-./rust/target/release/wgmesh-smoketest --key /tmp/host_a --base http://127.0.0.1:8443
-./rust/target/release/wgmesh-smoketest --key /tmp/host_b --base http://127.0.0.1:8443
-```
-
-You'll see each node get a stable `10.42.0.x` mesh IP and discover the other
-via `/peers`. No kernel WireGuard required while `relay_enabled=false`.
-
-### NixOS deployment
+> Every NixOS host with `services.openssh.enable = true` already has
+> `/etc/ssh/ssh_host_ed25519_key`. wgmesh derives the WireGuard keypair
+> from it on the fly. **You never run `ssh-keygen`. You never manage a
+> WireGuard private key.**
 
 ```nix
 # coordinator (public VPS)
 {
   imports = [ wgmesh.nixosModules.coordinator ];
+  services.openssh.enable = true;        # provides the host key
   services.wgmesh-coord = {
     enable = true;
     meshCidr = "10.42.0.0/16";
     authorizedSignersPath = "/etc/wgmesh/authorized_signers";
     openFirewall = true;
     relay = {
-      enable = true;
-      endpoint = "vps.example.com:51820";   # required: agents' UDP target
+      enable   = true;
+      endpoint = "vps.example.com:51820";  # required: agents' UDP target
     };
   };
   services.coturn = { enable = true; listening-port = 3478; no-tls = true;
@@ -172,28 +148,66 @@ via `/peers`. No kernel WireGuard required while `relay_enabled=false`.
 # every mesh node
 {
   imports = [ wgmesh.nixosModules.agent ];
-  services.openssh.enable = true;
+  services.openssh.enable = true;        # provides the host key
   services.wgmesh = {
-    enable = true;
+    enable      = true;
     coordinator = "https://mesh.example.com:8443";
     stunServer  = "stun.example.com:3478";
   };
 }
 ```
 
-Onboarding a new node:
+Onboarding a new node is a single pipe — the host key is read from disk,
+nothing is generated:
 
 ```sh
-# on the new node
-ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key
-
-# on the coord
-echo "ssh-ed25519 AAAA... new-node" >> /etc/wgmesh/authorized_signers
-systemctl reload wgmesh-coord     # SIGHUP, no downtime
+# read the existing public host key on the new node, append to coord's allowlist
+ssh node-x 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
+  | ssh coord 'cat >> /etc/wgmesh/authorized_signers \
+               && systemctl reload wgmesh-coord'
 ```
 
-That's it — the new node will register on its next reconcile tick and be
-reachable from the rest of the mesh.
+The new node registers on its next reconcile tick and is reachable from the
+rest of the mesh.
+
+### Try the conversion (no NixOS, no setup)
+
+`ssh-to-wg` mirrors `ssh-to-age`'s CLI: pipe any SSH public-key stream into
+it and get the WG public key out. Useful as a sanity check or when scripting
+allowlists:
+
+```sh
+# any host that already has an ed25519 SSH key (your own machine, GitHub, …)
+ssh-keyscan some.nixos.host | nix run github:xiongchenyu6/wgmesh#ssh-to-wg
+# → vknTxwj0J8f14zUlzjQxUJoiVAOuEdDgeMVORQT24yE=
+```
+
+### Test locally without NixOS
+
+If you don't have a NixOS host handy and want to drive the coord with two
+synthetic identities, generate a pair of throwaway keys for the smoketest:
+
+```sh
+git clone https://github.com/xiongchenyu6/wgmesh
+cd wgmesh/rust && cargo build --release && cd ..
+
+ssh-keygen -t ed25519 -N '' -f /tmp/host_a -C node-a
+ssh-keygen -t ed25519 -N '' -f /tmp/host_b -C node-b
+{ ssh-keygen -y -f /tmp/host_a; ssh-keygen -y -f /tmp/host_b; } > /tmp/auth
+
+cat > /tmp/coord.json <<'EOF'
+{ "listen_addr": "127.0.0.1:8443", "mesh_cidr": "10.42.0.0/16",
+  "state_path": "/tmp/state.json", "authorized_signers": "/tmp/auth",
+  "peer_ttl_seconds": 600, "relay_enabled": false }
+EOF
+
+./rust/target/release/wgmesh-coord -c /tmp/coord.json &
+./rust/target/release/wgmesh-smoketest --key /tmp/host_a --base http://127.0.0.1:8443
+./rust/target/release/wgmesh-smoketest --key /tmp/host_b --base http://127.0.0.1:8443
+```
+
+Each node gets a stable `10.42.0.x` mesh IP and discovers the other via
+`/peers`. No kernel WireGuard required while `relay_enabled=false`.
 
 ---
 

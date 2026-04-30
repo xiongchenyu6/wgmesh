@@ -105,50 +105,25 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
 
 ## 快速试用
 
-### 30 秒本地跑起来
+### NixOS：直接用现成的 SSH host key
 
-```sh
-git clone https://github.com/xiongchenyu6/wgmesh
-cd wgmesh/rust && cargo build --release
-cd ..
-
-ssh-keygen -t ed25519 -N '' -f /tmp/host_a -C node-a
-ssh-keygen -t ed25519 -N '' -f /tmp/host_b -C node-b
-{ ssh-keygen -y -f /tmp/host_a; ssh-keygen -y -f /tmp/host_b; } > /tmp/auth
-
-cat > /tmp/coord.json <<'EOF'
-{
-  "listen_addr":        "127.0.0.1:8443",
-  "mesh_cidr":          "10.42.0.0/16",
-  "state_path":         "/tmp/state.json",
-  "authorized_signers": "/tmp/auth",
-  "peer_ttl_seconds":   600,
-  "relay_enabled":      false
-}
-EOF
-
-./rust/target/release/wgmesh-coord -c /tmp/coord.json &
-./rust/target/release/wgmesh-smoketest --key /tmp/host_a --base http://127.0.0.1:8443
-./rust/target/release/wgmesh-smoketest --key /tmp/host_b --base http://127.0.0.1:8443
-```
-
-可以看到两个节点各自分到稳定的 `10.42.0.x` mesh IP，并通过 `/peers` 互相发现。
-设 `relay_enabled=false` 时无需内核态 WireGuard 也能跑。
-
-### NixOS 部署
+> 任何 `services.openssh.enable = true;` 的 NixOS 主机都已经有
+> `/etc/ssh/ssh_host_ed25519_key`。wgmesh 直接从它推导 WireGuard 密钥对。
+> **你不需要跑 `ssh-keygen`，也不用管理任何 WireGuard 私钥。**
 
 ```nix
 # 协调器（有公网 IP 的 VPS）
 {
   imports = [ wgmesh.nixosModules.coordinator ];
+  services.openssh.enable = true;        # 提供 host key
   services.wgmesh-coord = {
     enable = true;
     meshCidr = "10.42.0.0/16";
     authorizedSignersPath = "/etc/wgmesh/authorized_signers";
     openFirewall = true;
     relay = {
-      enable = true;
-      endpoint = "vps.example.com:51820";   # 必填：agent 用来连中继的 UDP host:port
+      enable   = true;
+      endpoint = "vps.example.com:51820";  # 必填：agent 用来连中继的 UDP host:port
     };
   };
   services.coturn = { enable = true; listening-port = 3478; no-tls = true;
@@ -161,27 +136,63 @@ EOF
 # 每个 mesh 节点
 {
   imports = [ wgmesh.nixosModules.agent ];
-  services.openssh.enable = true;
+  services.openssh.enable = true;        # 提供 host key
   services.wgmesh = {
-    enable = true;
+    enable      = true;
     coordinator = "https://mesh.example.com:8443";
     stunServer  = "stun.example.com:3478";
   };
 }
 ```
 
-接入新节点：
+接入新节点是一条管道命令——读现成的 host key，啥都不生成：
 
 ```sh
-# 在新节点上
-ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key
-
-# 在协调器上
-echo "ssh-ed25519 AAAA... new-node" >> /etc/wgmesh/authorized_signers
-systemctl reload wgmesh-coord     # SIGHUP，零中断
+# 在新节点上读取已有的公钥，追加到协调器的允许列表
+ssh node-x 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key' \
+  | ssh coord 'cat >> /etc/wgmesh/authorized_signers \
+               && systemctl reload wgmesh-coord'
 ```
 
-完事——新节点会在下一次 reconcile tick 自动注册，并被网内其它节点发现。
+新节点会在下一次 reconcile tick 自动注册，并被网内其它节点发现。
+
+### 单独验证转换（无需 NixOS、无需任何配置）
+
+`ssh-to-wg` 的 CLI 与 `ssh-to-age` 完全一致：把任何 SSH 公钥流喂给它，输出
+对应的 WG 公钥。可以用来快速验证或写脚本生成允许列表：
+
+```sh
+# 任何已有 ed25519 SSH key 的主机（你自己的机器、GitHub 等）
+ssh-keyscan some.nixos.host | nix run github:xiongchenyu6/wgmesh#ssh-to-wg
+# → vknTxwj0J8f14zUlzjQxUJoiVAOuEdDgeMVORQT24yE=
+```
+
+### 不在 NixOS 上本地试一下
+
+如果手边没有 NixOS 主机，又想用两个虚构的身份打通协调器，
+可以临时生成两把测试用 key 喂给 smoketest：
+
+```sh
+git clone https://github.com/xiongchenyu6/wgmesh
+cd wgmesh/rust && cargo build --release && cd ..
+
+ssh-keygen -t ed25519 -N '' -f /tmp/host_a -C node-a
+ssh-keygen -t ed25519 -N '' -f /tmp/host_b -C node-b
+{ ssh-keygen -y -f /tmp/host_a; ssh-keygen -y -f /tmp/host_b; } > /tmp/auth
+
+cat > /tmp/coord.json <<'EOF'
+{ "listen_addr": "127.0.0.1:8443", "mesh_cidr": "10.42.0.0/16",
+  "state_path": "/tmp/state.json", "authorized_signers": "/tmp/auth",
+  "peer_ttl_seconds": 600, "relay_enabled": false }
+EOF
+
+./rust/target/release/wgmesh-coord -c /tmp/coord.json &
+./rust/target/release/wgmesh-smoketest --key /tmp/host_a --base http://127.0.0.1:8443
+./rust/target/release/wgmesh-smoketest --key /tmp/host_b --base http://127.0.0.1:8443
+```
+
+两个节点各自分到稳定的 `10.42.0.x` mesh IP，并通过 `/peers` 互相发现。
+设 `relay_enabled=false` 时无需内核态 WireGuard 也能跑。
 
 ---
 
