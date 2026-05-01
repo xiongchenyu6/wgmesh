@@ -44,26 +44,29 @@ wgmesh 的设计目标是 **NixOS 下最快速度起一张网**。其它特性�
 
 ## 架构
 
+```mermaid
+flowchart TB
+    Coord["<b>协调器</b>（公网 IP 的 VPS）<br/>HTTP API: /register · /peers<br/>wg0 中继: 10.42.0.1/16"]
+    A["节点 A<br/>(NAT)"]
+    B["节点 B<br/>(NAT)"]
+    C["节点 C<br/>(公网)"]
+
+    Coord -. "签名 HTTPS + UDP/51820" .-> A
+    Coord -. "签名 HTTPS + UDP/51820" .-> B
+    Coord -. "签名 HTTPS + UDP/51820" .-> C
+
+    A <== "直连 WireGuard" ==> B
+    A <== "直连 WireGuard" ==> C
+    B <== "直连 WireGuard" ==> C
+
+    classDef coord fill:#5277c3,stroke:#2c3e50,color:#fff,stroke-width:2px
+    classDef node fill:#f4f6f8,stroke:#5277c3,color:#2c3e50
+    class Coord coord
+    class A,B,C node
 ```
-              ┌───────────────────────────┐
-              │  协调器 (有公网 IP 的 VPS)  │
-              │   ─────────────────────   │
-              │   HTTP API: /register     │
-              │              /peers       │
-              │   wg0 中继: 10.42.0.1/16  │
-              └───────────┬───────────────┘
-                          │  签名 HTTPS  +  UDP/51820
-              ┌───────────┼───────────────┐
-              ▼           ▼               ▼
-          ┌───────┐   ┌───────┐       ┌───────┐
-          │节点 A │   │节点 B │       │节点 C │
-          │ NAT   │   │ NAT   │       │ 公网  │
-          └───┬───┘   └───┬───┘       └───┬───┘
-              │           │               │
-              └───┬───────┴───────┬───────┘
-                  └─ 直连 WireGuard ┘
-              （直连失败时走协调器中继）
-```
+
+> 实线是内核态 WireGuard 直连隧道；虚线是控制面 HTTPS 加上协调器中继兜底
+> 用的 UDP/51820。
 
 协调器跑 HTTP 控制面 + 一个内核态 WireGuard 接口做数据面。每个 agent 的 wg0
 都把协调器作为一个 peer，`AllowedIPs = mesh_cidr`（默认走它）。
@@ -80,18 +83,14 @@ wgmesh 的设计目标是 **NixOS 下最快速度起一张网**。其它特性�
 ——会在直连失败时**黑洞流量**：本地 `/32` 路由比协调器的 `/16` 优先，
 但 peer 又连不通。wgmesh 用一个状态机绕开这个问题：
 
-```
-                     60s 内握手成功
-            ┌─────┐  ───────────────────►  ┌───────┐
-未知 ─────► │PROB │                        │DIRECT │
-            │ING  │  ◄───────────────────  │       │
-            └──┬──┘   5 分钟未握手          └───────┘
-               │
-   60s 内未握手
-               ▼
-            ┌─────┐
-            │RELAY│  ───── 退避后重试 ─────► PROBING
-            └─────┘   (5 分钟 → 30 分钟封顶, 每次 ×2)
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PROBING : 新 peer
+    PROBING --> DIRECT : 60s 内握手成功
+    DIRECT --> PROBING : 5 分钟未握手
+    PROBING --> RELAY : 60s 内未握手
+    RELAY --> PROBING : 退避后重试<br/>(5 分钟 → 30 分钟封顶，每次 ×2)
 ```
 
 | 状态     | 在 wg0 的表现                       | 路由效果                      |

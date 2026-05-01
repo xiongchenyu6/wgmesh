@@ -52,26 +52,29 @@ Every other property follows from that.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    Coord["<b>Coordinator</b> (public VPS)<br/>HTTP API: /register · /peers<br/>wg0 hub: 10.42.0.1/16"]
+    A["Node A<br/>(NAT)"]
+    B["Node B<br/>(NAT)"]
+    C["Node C<br/>(public)"]
+
+    Coord -. "signed HTTPS + UDP/51820" .-> A
+    Coord -. "signed HTTPS + UDP/51820" .-> B
+    Coord -. "signed HTTPS + UDP/51820" .-> C
+
+    A <== "direct WG" ==> B
+    A <== "direct WG" ==> C
+    B <== "direct WG" ==> C
+
+    classDef coord fill:#5277c3,stroke:#2c3e50,color:#fff,stroke-width:2px
+    classDef node fill:#f4f6f8,stroke:#5277c3,color:#2c3e50
+    class Coord coord
+    class A,B,C node
 ```
-              ┌───────────────────────────┐
-              │   Coordinator (public VPS)│
-              │   ─────────────────────   │
-              │   HTTP API: /register     │
-              │              /peers       │
-              │   wg0 hub:  10.42.0.1/16  │
-              └───────────┬───────────────┘
-                          │  signed HTTPS  +  UDP/51820
-              ┌───────────┼───────────────┐
-              ▼           ▼               ▼
-          ┌───────┐   ┌───────┐       ┌───────┐
-          │Node A │   │Node B │       │Node C │
-          │ NAT   │   │ NAT   │       │ public│
-          └───┬───┘   └───┬───┘       └───┬───┘
-              │           │               │
-              └───┬───────┴───────┬───────┘
-                  └── direct WG ──┘
-                (relay-via-coord when direct fails)
-```
+
+> Solid edges are direct kernel-WireGuard tunnels; dotted edges are the
+> control-plane HTTPS plus the relay-fallback UDP/51820 to the coord.
 
 The coord runs HTTP for control + a kernel WireGuard interface for data.
 Every agent's wg0 has the coord installed as a peer with
@@ -90,18 +93,14 @@ A naive design — "add the peer with `AllowedIPs = peer.mesh/32` and hope" —
 black-holes traffic when the direct connection fails: the `/32` claims the
 route locally and beats the coord's `/16`. wgmesh sidesteps that:
 
-```
-                     handshake within 60s
-            ┌─────┐  ───────────────────►  ┌───────┐
-unknown ─►  │PROB │                        │DIRECT │
-            │ING  │  ◄───────────────────  │       │
-            └──┬──┘   handshake stale 5min └───────┘
-               │
-   60s no handshake
-               ▼
-            ┌─────┐
-            │RELAY│  ───── retry after backoff ─────► PROBING
-            └─────┘   (5 min → 30 min cap, 2× each)
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PROBING : new peer
+    PROBING --> DIRECT : handshake within 60s
+    DIRECT --> PROBING : handshake stale 5 min
+    PROBING --> RELAY : 60s, no handshake
+    RELAY --> PROBING : retry after backoff<br/>(5 min → 30 min cap, 2× each)
 ```
 
 | State    | wg0 peer entry                     | Effect on routing               |
