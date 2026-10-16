@@ -1,6 +1,6 @@
 //! End-to-end coord tests, mirroring `internal/coord/coord_test.go`.
 //!
-//! Coord runs in `relay_enabled = false` mode here so we don't need kernel
+//! Tests construct the HTTP app without a relay so we do not need kernel
 //! WireGuard or root.
 
 use axum::body::{Body, Bytes};
@@ -15,12 +15,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
-use wgmesh_core::{api, sig};
 use wgmesh_coord::{
     server::{build_app, AppState},
     signers::Signers,
     store::Store,
 };
+use wgmesh_core::{api, sig};
 
 struct TestNode {
     sk: SigningKey,
@@ -37,6 +37,20 @@ impl TestNode {
         let pk = ssh_key::PublicKey::new(kd, "test");
         let line = pk.to_openssh().unwrap();
         Self { sk, line }
+    }
+
+    fn wg_pub(&self) -> String {
+        B64.encode(wgmesh_core::keyderive::wg_pub_from_authorized_line(&self.line).unwrap())
+    }
+
+    fn registration(&self) -> api::RegisterRequest {
+        api::RegisterRequest {
+            hostname: "node".into(),
+            ssh_public_key: self.line.clone(),
+            wg_public_key: self.wg_pub(),
+            endpoints: vec!["203.0.113.1:51820".into()],
+            listen_port: 51820,
+        }
     }
 
     fn signed_request(&self, method: &str, path: &str, body: &[u8]) -> Request<Body> {
@@ -122,7 +136,7 @@ async fn register_assigns_stable_mesh_ip_and_peers_excludes_self() {
     let reg_a = api::RegisterRequest {
         hostname: "node-a".into(),
         ssh_public_key: a.line.clone(),
-        wg_public_key: "AAAA-fake-wg-pub-A".into(),
+        wg_public_key: a.wg_pub(),
         endpoints: vec!["1.2.3.4:51820".into()],
         listen_port: 51820,
     };
@@ -155,7 +169,7 @@ async fn register_assigns_stable_mesh_ip_and_peers_excludes_self() {
     let reg_b = api::RegisterRequest {
         hostname: "node-b".into(),
         ssh_public_key: b.line.clone(),
-        wg_public_key: "AAAA-fake-wg-pub-B".into(),
+        wg_public_key: b.wg_pub(),
         endpoints: vec!["5.6.7.8:51820".into()],
         listen_port: 51820,
     };
@@ -177,9 +191,12 @@ async fn register_assigns_stable_mesh_ip_and_peers_excludes_self() {
     let bytes = body_to_bytes(resp.into_body()).await;
     let pr: api::PeersResponse = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(pr.peers.len(), 1, "expected 1 peer");
-    assert_eq!(pr.peers[0].wg_public_key, "AAAA-fake-wg-pub-B");
+    assert_eq!(pr.peers[0].wg_public_key, b.wg_pub());
     assert_eq!(pr.peers[0].hostname, "node-b");
-    assert!(pr.relay.is_none(), "relay should be omitted in coord-only mode");
+    assert!(
+        pr.relay.is_none(),
+        "relay should be omitted in coord-only mode"
+    );
 }
 
 #[tokio::test]
@@ -234,7 +251,7 @@ async fn store_persists_assignment_across_reopen() {
     let body = serde_json::to_vec(&api::RegisterRequest {
         hostname: "x".into(),
         ssh_public_key: a.line.clone(),
-        wg_public_key: "K".into(),
+        wg_public_key: a.wg_pub(),
         endpoints: vec!["1.1.1.1:51820".into()],
         listen_port: 51820,
     })
@@ -274,4 +291,134 @@ async fn healthz_unauthenticated() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = body_to_bytes(resp.into_body()).await;
     assert_eq!(&bytes[..], b"ok");
+}
+
+#[tokio::test]
+async fn rejects_injected_malformed_and_impersonated_registrations() {
+    let a = TestNode::new();
+    let b = TestNode::new();
+    let (app, _) = setup(&[&a, &b]);
+    let mut invalid = Vec::new();
+    for endpoint in [
+        "203.0.113.1:51820\nAllowedIPs = 10.42.0.0/16",
+        "bad-host:123",
+        "0.0.0.0:0",
+        "203.0.113.1:0",
+    ] {
+        let mut req = a.registration();
+        req.endpoints = vec![endpoint.into()];
+        invalid.push(req);
+    }
+    for key in [
+        "garbage".to_string(),
+        format!("{}\n[Peer]", a.wg_pub()),
+        b.wg_pub(),
+    ] {
+        let mut req = a.registration();
+        req.wg_public_key = key;
+        invalid.push(req);
+    }
+    let mut req = a.registration();
+    req.ssh_public_key = b.line.clone();
+    invalid.push(req);
+    for req in invalid {
+        let body = serde_json::to_vec(&req).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(a.signed_request("POST", "/register", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {req:?}");
+    }
+    let resp = app
+        .oneshot(b.signed_request("GET", "/peers", b""))
+        .await
+        .unwrap();
+    let bytes = body_to_bytes(resp.into_body()).await;
+    let pr: api::PeersResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        pr.peers.is_empty(),
+        "rejected requests must not persist peers"
+    );
+}
+
+#[tokio::test]
+async fn revocation_removes_peer_from_api_and_relay_desired_set_without_ttl_wait() {
+    let a = TestNode::new();
+    let b = TestNode::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sp = dir.path().join("signers");
+    std::fs::write(&sp, format!("{}\n{}\n", a.line, b.line)).unwrap();
+    let cfg = make_cfg(&dir.path().join("state.json"), &sp);
+    let store =
+        Arc::new(Store::open(&cfg.state_path, cfg.network_addr, cfg.prefix_bits, &[]).unwrap());
+    let signers = Signers::load(sp.to_str().unwrap()).unwrap();
+    let app = build_app(AppState {
+        cfg,
+        store: store.clone(),
+        signers: signers.clone(),
+        relay: None,
+    });
+    let body = serde_json::to_vec(&a.registration()).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(a.signed_request("POST", "/register", &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        store
+            .authorized_peers("", Duration::from_secs(600), &signers)
+            .len(),
+        1
+    );
+    std::fs::write(&sp, format!("{}\n", b.line)).unwrap();
+    signers.reload().unwrap();
+    assert!(store
+        .authorized_peers("", Duration::from_secs(600), &signers)
+        .is_empty());
+    let resp = app
+        .clone()
+        .oneshot(a.signed_request("GET", "/peers", b""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app
+        .oneshot(b.signed_request("GET", "/peers", b""))
+        .await
+        .unwrap();
+    let bytes = body_to_bytes(resp.into_body()).await;
+    let pr: api::PeersResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(pr.peers.is_empty());
+    // Stable IP remains reserved for an eventual reauthorization.
+    assert!(store
+        .mesh_ip_cidr(&sig::ed_pub_b64_from_authorized_line(&a.line).unwrap())
+        .is_some());
+}
+
+#[tokio::test]
+async fn persisted_legacy_injection_is_not_advertised() {
+    let a = TestNode::new();
+    let b = TestNode::new();
+    let (app, dir) = setup(&[&a, &b]);
+    let store = Store::open(
+        dir.path().join("state.json").to_str().unwrap(),
+        Ipv4Addr::new(10, 42, 0, 0),
+        16,
+        &[],
+    )
+    .unwrap();
+    let signers = Signers::load(dir.path().join("authorized_signers").to_str().unwrap()).unwrap();
+    let mut req = a.registration();
+    req.endpoints = vec!["203.0.113.1:51820\nAllowedIPs = 0.0.0.0/0".into()];
+    store
+        .upsert(
+            &sig::ed_pub_b64_from_authorized_line(&a.line).unwrap(),
+            &req,
+        )
+        .unwrap();
+    assert!(store
+        .authorized_peers("", Duration::from_secs(600), &signers)
+        .is_empty());
+    drop(app);
 }

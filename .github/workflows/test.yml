@@ -1,0 +1,22 @@
+name: Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  rust-and-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install networking tools
+        run: sudo apt-get update && sudo apt-get install -y wireguard-tools iproute2 iptables openssh-client
+      - name: Workspace tests
+        run: cargo test --workspace --locked --manifest-path rust/Cargo.toml
+      - name: Build binaries
+        run: cargo build --workspace --locked --manifest-path rust/Cargo.toml
+      - name: Kernel relay, direct connection and revocation
+        run: sudo bash tests/kernel-mesh.sh

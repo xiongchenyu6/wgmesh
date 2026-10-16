@@ -8,7 +8,6 @@
   services.wgmesh = {
     enable = true;
     coordinator = "https://mesh.example.com:8443";
-    stunServer = "stun.example.com:3478";
     interface = "wg0";
     listenPort = 51820;
     includeLAN = true;

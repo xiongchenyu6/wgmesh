@@ -71,10 +71,7 @@ impl Manager {
     /// Create the WG interface if absent and bring it up.
     pub fn ensure_link(&self) -> Result<(), WgError> {
         if !self.link_exists()? {
-            run(
-                "ip",
-                &["link", "add", &self.iface, "type", "wireguard"],
-            )?;
+            run("ip", &["link", "add", &self.iface, "type", "wireguard"])?;
         }
         run("ip", &["link", "set", &self.iface, "up"])?;
         Ok(())
@@ -158,16 +155,13 @@ impl Manager {
 
     /// Atomically replace the device's full peer set with `peers`.
     pub fn replace_peers(&self, peers: &[PeerSpec]) -> Result<(), WgError> {
+        validate_peers(peers)?;
         let conf = render_syncconf(peers);
         debug!(iface = %self.iface, peers = peers.len(), "syncconf");
         let path = tempfile_with_mode(conf.as_bytes(), 0o600)?;
         let res = run(
             "wg",
-            &[
-                "syncconf",
-                &self.iface,
-                path.to_string_lossy().as_ref(),
-            ],
+            &["syncconf", &self.iface, path.to_string_lossy().as_ref()],
         );
         let _ = std::fs::remove_file(&path);
         res
@@ -204,6 +198,62 @@ impl Manager {
             .trim()
             .parse()
             .map_err(|e: std::num::ParseIntError| WgError::InvalidValue(e.to_string()))
+    }
+}
+
+/// Reject values that could alter the structure or ownership of a WG config.
+/// Endpoints are numeric socket addresses; relay hostnames are resolved by
+/// the agent before reaching this boundary.
+pub fn validate_peers(peers: &[PeerSpec]) -> Result<(), WgError> {
+    let mut keys = std::collections::HashSet::new();
+    for p in peers {
+        validate_public_key(&p.pub_key_b64)?;
+        if !keys.insert(&p.pub_key_b64) {
+            return Err(WgError::InvalidValue("duplicate peer public key".into()));
+        }
+        if let Some(ep) = &p.endpoint {
+            validate_endpoint(ep)?;
+        }
+        for cidr in &p.allowed_ips {
+            let valid = cidr.split_once('/').is_some_and(|(ip, bits)| {
+                match (ip.parse::<std::net::IpAddr>(), bits.parse::<u8>()) {
+                    (Ok(std::net::IpAddr::V4(_)), Ok(n)) => n <= 32,
+                    (Ok(std::net::IpAddr::V6(_)), Ok(n)) => n <= 128,
+                    _ => false,
+                }
+            });
+            if !valid {
+                return Err(WgError::InvalidValue("invalid AllowedIPs CIDR".into()));
+            }
+        }
+        if p.keepalive_secs.is_some_and(|n| n > u16::MAX as u32) {
+            return Err(WgError::InvalidValue("invalid keepalive interval".into()));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_public_key(value: &str) -> Result<(), WgError> {
+    match B64.decode(value) {
+        Ok(bytes)
+            if bytes.len() == 32
+                && bytes.iter().any(|b| *b != 0)
+                && B64.encode(&bytes) == value =>
+        {
+            Ok(())
+        }
+        _ => Err(WgError::InvalidValue("invalid WireGuard public key".into())),
+    }
+}
+
+pub fn validate_endpoint(value: &str) -> Result<(), WgError> {
+    match value.parse::<std::net::SocketAddr>() {
+        Ok(addr)
+            if addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast() =>
+        {
+            Ok(())
+        }
+        _ => Err(WgError::InvalidValue("invalid numeric endpoint".into())),
     }
 }
 
@@ -262,8 +312,7 @@ fn parse_wg_dump(s: &str) -> Result<HashMap<String, PeerInfo>, WgError> {
             "(none)" | "" => None,
             s => Some(s.to_string()),
         };
-        let last_handshake_unix: i64 =
-            fields[4].parse().unwrap_or(0);
+        let last_handshake_unix: i64 = fields[4].parse().unwrap_or(0);
         let rx_bytes: u64 = fields[5].parse().unwrap_or(0);
         let tx_bytes: u64 = fields[6].parse().unwrap_or(0);
         out.insert(
@@ -281,10 +330,7 @@ fn parse_wg_dump(s: &str) -> Result<HashMap<String, PeerInfo>, WgError> {
 }
 
 fn run(bin: &str, args: &[&str]) -> Result<(), WgError> {
-    let out = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()?;
+    let out = Command::new(bin).args(args).stdin(Stdio::null()).output()?;
     if out.status.success() {
         return Ok(());
     }
@@ -331,7 +377,10 @@ mod tests {
         let cfg = render_syncconf(&peers);
         assert!(cfg.contains("[Peer]"));
         assert!(cfg.contains("PublicKey = AAAA"));
-        assert!(cfg.contains("AllowedIPs = \n"), "expected empty AllowedIPs, got:\n{cfg}");
+        assert!(
+            cfg.contains("AllowedIPs = \n"),
+            "expected empty AllowedIPs, got:\n{cfg}"
+        );
         assert!(cfg.contains("Endpoint = 1.2.3.4:51820"));
         assert!(cfg.contains("PersistentKeepalive = 25"));
     }
@@ -372,5 +421,29 @@ mod tests {
         let p = m.get("PEERPUB").unwrap();
         assert!(p.endpoint.is_none());
         assert_eq!(p.last_handshake_unix, 0);
+    }
+    #[test]
+    fn rejects_config_injection_at_kernel_boundary() {
+        let valid = PeerSpec {
+            pub_key_b64: B64.encode([42u8; 32]),
+            endpoint: Some("203.0.113.1:51820".into()),
+            allowed_ips: vec!["10.42.0.2/32".into()],
+            keepalive_secs: Some(25),
+        };
+        assert!(validate_peers(&[valid.clone()]).is_ok());
+        for field in 0..3 {
+            let mut peer = valid.clone();
+            match field {
+                0 => peer.pub_key_b64.push_str("\n[Peer]"),
+                1 => peer.endpoint = Some("203.0.113.1:51820\nAllowedIPs = 0.0.0.0/0".into()),
+                _ => peer.allowed_ips = vec!["10.42.0.2/32\n[Peer]".into()],
+            }
+            // This must fail before invoking wg, including on non-Linux hosts.
+            assert!(matches!(
+                Manager::new("unused").replace_peers(&[peer]),
+                Err(WgError::InvalidValue(_))
+            ));
+        }
+        assert!(validate_peers(&[valid.clone(), valid]).is_err());
     }
 }

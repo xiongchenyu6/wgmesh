@@ -70,6 +70,8 @@ struct PeerEntry {
     last_handshake: Option<SystemTime>,
     backoff: Duration,
     next_retry: Option<SystemTime>,
+    candidate_index: usize,
+    direct_endpoint: Option<String>,
 }
 
 pub struct ProbeManager {
@@ -114,26 +116,46 @@ impl ProbeManager {
                 continue;
             }
             seen.insert(p.wg_public_key.clone());
-            let entry = self.peers.entry(p.wg_public_key.clone()).or_insert_with(|| {
-                info!(
-                    hostname = %p.hostname,
-                    mesh = %p.mesh_ip,
-                    "new peer → PROBING"
-                );
-                PeerEntry {
-                    pub_b64: p.wg_public_key.clone(),
-                    mesh_ip: String::new(),
-                    endpoints: vec![],
-                    hostname: String::new(),
-                    state: ProbeState::Probing,
-                    probing_since: now,
-                    last_handshake: None,
-                    backoff: self.tunables.initial_backoff,
-                    next_retry: None,
-                }
-            });
+            let entry = self
+                .peers
+                .entry(p.wg_public_key.clone())
+                .or_insert_with(|| {
+                    info!(
+                        hostname = %p.hostname,
+                        mesh = %p.mesh_ip,
+                        "new peer → PROBING"
+                    );
+                    PeerEntry {
+                        pub_b64: p.wg_public_key.clone(),
+                        mesh_ip: String::new(),
+                        endpoints: vec![],
+                        hostname: String::new(),
+                        state: ProbeState::Probing,
+                        probing_since: now,
+                        last_handshake: None,
+                        backoff: self.tunables.initial_backoff,
+                        next_retry: None,
+                        candidate_index: 0,
+                        direct_endpoint: None,
+                    }
+                });
             entry.mesh_ip = p.mesh_ip.clone();
-            entry.endpoints = p.endpoints.clone();
+            let candidates: Vec<_> = p
+                .endpoints
+                .iter()
+                .filter(|ep| wgmesh_wglink::validate_endpoint(ep).is_ok())
+                .cloned()
+                .collect();
+            let selected = entry.endpoints.get(entry.candidate_index);
+            let new_index = selected.and_then(|ep| candidates.iter().position(|v| v == ep));
+            if !entry.endpoints.is_empty()
+                && new_index.is_none()
+                && entry.state == ProbeState::Probing
+            {
+                entry.probing_since = now;
+            }
+            entry.candidate_index = new_index.unwrap_or(0);
+            entry.endpoints = candidates;
             entry.hostname = p.hostname.clone();
         }
         let drop_keys: Vec<String> = self
@@ -162,7 +184,23 @@ impl ProbeManager {
                 ProbeState::Probing => {
                     if let Some(hs) = e.last_handshake {
                         if let Ok(age) = now.duration_since(hs) {
-                            if age < self.tunables.probe_window {
+                            // Kernel handshake timestamps have one-second precision.
+                            // Compare at that precision so a handshake in the
+                            // first probe second is not mistaken for an old one.
+                            let probe_second = e
+                                .probing_since
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let handshake_second =
+                                hs.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                            if age < self.tunables.probe_window && handshake_second >= probe_second
+                            {
+                                e.direct_endpoint = handshakes
+                                    .get(&e.pub_b64)
+                                    .and_then(|info| info.endpoint.clone())
+                                    .filter(|ep| wgmesh_wglink::validate_endpoint(ep).is_ok())
+                                    .or_else(|| e.endpoints.get(e.candidate_index).cloned());
                                 e.state = ProbeState::Direct;
                                 e.backoff = self.tunables.initial_backoff;
                                 info!(
@@ -176,6 +214,11 @@ impl ProbeManager {
                     }
                     if let Ok(elapsed) = now.duration_since(e.probing_since) {
                         if elapsed > self.tunables.probe_window {
+                            if e.candidate_index + 1 < e.endpoints.len() {
+                                e.candidate_index += 1;
+                                e.probing_since = now;
+                                continue;
+                            }
                             e.state = ProbeState::Relay;
                             e.next_retry = Some(now + e.backoff);
                             info!(
@@ -187,6 +230,17 @@ impl ProbeManager {
                     }
                 }
                 ProbeState::Direct => {
+                    // Keep authenticated roaming updates, including addresses
+                    // absent from the registered candidate list.
+                    if let Some(info) = handshakes.get(&e.pub_b64) {
+                        if info.last_handshake_unix > 0 {
+                            if let Some(ep) = &info.endpoint {
+                                if wgmesh_wglink::validate_endpoint(ep).is_ok() {
+                                    e.direct_endpoint = Some(ep.clone());
+                                }
+                            }
+                        }
+                    }
                     if let Some(hs) = e.last_handshake {
                         if let Ok(age) = now.duration_since(hs) {
                             if age > self.tunables.direct_stale_after {
@@ -206,7 +260,9 @@ impl ProbeManager {
                         if now > retry {
                             e.state = ProbeState::Probing;
                             e.probing_since = now;
-                            let grown = duration_mul_f64(e.backoff, self.tunables.backoff_multiplier);
+                            e.candidate_index = 0;
+                            let grown =
+                                duration_mul_f64(e.backoff, self.tunables.backoff_multiplier);
                             e.backoff = grown.min(self.tunables.max_backoff);
                             info!(
                                 hostname = %e.hostname,
@@ -249,7 +305,7 @@ impl ProbeManager {
             match e.state {
                 ProbeState::Probing => {
                     summary.probing += 1;
-                    let endpoint = e.endpoints.first().cloned();
+                    let endpoint = e.endpoints.get(e.candidate_index).cloned();
                     if endpoint.is_none() {
                         // Can't probe without an endpoint.
                         continue;
@@ -265,7 +321,7 @@ impl ProbeManager {
                     summary.direct += 1;
                     specs.push(PeerSpec {
                         pub_key_b64: e.pub_b64.clone(),
-                        endpoint: e.endpoints.first().cloned(),
+                        endpoint: e.direct_endpoint.clone(),
                         allowed_ips: vec![format!("{}/32", e.mesh_ip)],
                         keepalive_secs: Some(self.tunables.keepalive.as_secs() as u32),
                     });
@@ -412,11 +468,13 @@ mod tests {
         let t0 = unix(1_000_000);
         pm.reconcile(&[peer("A")], Some(&fake_relay()), &HashMap::new(), t0);
         let t1 = t0 + 2 * pm.tunables.probe_window;
-        let (specs, sum) =
-            pm.reconcile(&[peer("A")], Some(&fake_relay()), &HashMap::new(), t1);
+        let (specs, sum) = pm.reconcile(&[peer("A")], Some(&fake_relay()), &HashMap::new(), t1);
         assert_eq!(sum.relayed, 1);
         assert_eq!(sum.probing, 0);
-        assert!(find(&specs, "A").is_none(), "RELAY peer must NOT be in wg0 specs");
+        assert!(
+            find(&specs, "A").is_none(),
+            "RELAY peer must NOT be in wg0 specs"
+        );
         assert!(sum.has_relay);
     }
 
@@ -466,7 +524,10 @@ mod tests {
         let t1 = t0 + pm.tunables.direct_stale_after + Duration::from_secs(60);
         let (specs, sum) = pm.reconcile(&[peer("A")], Some(&fake_relay()), &hs, t1);
         assert_eq!(sum.relayed, 1);
-        assert!(find(&specs, "A").is_none(), "demoted peer must not be in wg0");
+        assert!(
+            find(&specs, "A").is_none(),
+            "demoted peer must not be in wg0"
+        );
     }
 
     #[test]
@@ -475,7 +536,12 @@ mod tests {
         let t0 = unix(1_000_000);
         pm.reconcile(&[peer("A")], Some(&fake_relay()), &HashMap::new(), t0);
         assert!(pm.has_entry("A"));
-        pm.reconcile(&[], Some(&fake_relay()), &HashMap::new(), t0 + Duration::from_secs(1));
+        pm.reconcile(
+            &[],
+            Some(&fake_relay()),
+            &HashMap::new(),
+            t0 + Duration::from_secs(1),
+        );
         assert!(!pm.has_entry("A"));
     }
 
@@ -484,7 +550,88 @@ mod tests {
         let mut pm = ProbeManager::new();
         let (specs, sum) = pm.reconcile(&[], Some(&fake_relay()), &HashMap::new(), unix(1_000_000));
         assert!(sum.has_relay);
-        assert_eq!(specs.len(), 1, "expected 1 spec (relay), got {}", specs.len());
+        assert_eq!(
+            specs.len(),
+            1,
+            "expected 1 spec (relay), got {}",
+            specs.len()
+        );
         assert_eq!(specs[0].allowed_ips, vec!["10.42.0.0/16".to_string()]);
+    }
+    #[test]
+    fn tries_next_candidate_and_keeps_authenticated_roaming_endpoint() {
+        let mut pm = ProbeManager::new();
+        let t0 = unix(1_000_000);
+        let mut p = peer("A");
+        p.endpoints = vec!["192.168.1.10:51820".into(), "203.0.113.10:51820".into()];
+        let (specs, _) = pm.reconcile(&[p.clone()], None, &HashMap::new(), t0);
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("192.168.1.10:51820")
+        );
+        let (specs, sum) = pm.reconcile(
+            &[p.clone()],
+            None,
+            &HashMap::new(),
+            t0 + Duration::from_secs(61),
+        );
+        assert_eq!(sum.probing, 1);
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("203.0.113.10:51820")
+        );
+        let hs = HashMap::from([(
+            "A".into(),
+            PeerInfo {
+                last_handshake_unix: 1_000_062,
+                endpoint: Some("203.0.113.10:61234".into()),
+                ..Default::default()
+            },
+        )]);
+        let (specs, sum) = pm.reconcile(&[p.clone()], None, &hs, t0 + Duration::from_secs(63));
+        assert_eq!(sum.direct, 1);
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("203.0.113.10:61234")
+        );
+        p.endpoints.reverse();
+        let (specs, _) = pm.reconcile(&[p], None, &hs, t0 + Duration::from_secs(90));
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("203.0.113.10:61234")
+        );
+    }
+
+    #[test]
+    fn tries_all_candidates_before_relay_and_restarts_after_backoff() {
+        let mut pm = ProbeManager::new();
+        let mut p = peer("A");
+        p.endpoints.push("203.0.113.10:51820".into());
+        for secs in [0, 61, 122] {
+            pm.reconcile(&[p.clone()], None, &HashMap::new(), unix(1_000_000 + secs));
+        }
+        assert_eq!(pm.entry_state("A"), Some(ProbeState::Relay));
+        let now = pm.entry_next_retry("A").unwrap() + Duration::from_secs(1);
+        let (specs, _) = pm.reconcile(&[p], None, &HashMap::new(), now);
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("1.2.3.4:51820")
+        );
+    }
+    #[test]
+    fn handshake_in_first_fractional_probe_second_is_promoted() {
+        let mut pm = ProbeManager::new();
+        let start = unix(1_000_000) + Duration::from_millis(900);
+        pm.reconcile(&[peer("A")], None, &HashMap::new(), start);
+        let hs = HashMap::from([(
+            "A".into(),
+            PeerInfo {
+                last_handshake_unix: 1_000_000,
+                endpoint: Some("1.2.3.4:51820".into()),
+                ..Default::default()
+            },
+        )]);
+        let (_, summary) = pm.reconcile(&[peer("A")], None, &hs, start + Duration::from_secs(1));
+        assert_eq!(summary.direct, 1);
     }
 }

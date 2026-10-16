@@ -82,20 +82,11 @@ impl Store {
         Ok(s)
     }
 
-    pub fn upsert(
-        &self,
-        ed_pub: &str,
-        req: &api::RegisterRequest,
-    ) -> Result<String, StoreError> {
+    pub fn upsert(&self, ed_pub: &str, req: &api::RegisterRequest) -> Result<String, StoreError> {
         let mut g = self.inner.lock().unwrap();
         let mesh_ip = match g.nodes.get(ed_pub) {
             Some(n) => n.mesh_ip.clone(),
-            None => allocate_locked(
-                &mut g,
-                self.network,
-                self.prefix_bits,
-                &self.reserved,
-            )?,
+            None => allocate_locked(&mut g, self.network, self.prefix_bits, &self.reserved)?,
         };
         let node = Node {
             ed_pub: ed_pub.to_string(),
@@ -134,6 +125,50 @@ impl Store {
             .collect();
         out.sort_by(|a, b| a.mesh_ip.cmp(&b.mesh_ip));
         out
+    }
+
+    /// Apply authorization to persisted identities as well as API callers.
+    pub fn authorized_peers(
+        &self,
+        self_ed_pub: &str,
+        ttl: Duration,
+        signers: &crate::signers::Signers,
+    ) -> Vec<api::Peer> {
+        let authorized = signers.snapshot();
+        let g = self.inner.lock().unwrap();
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let mut peers: Vec<_> = g
+            .nodes
+            .values()
+            .filter(|n| {
+                n.ed_pub != self_ed_pub && authorized.contains(&n.ed_pub) && n.last_seen >= cutoff
+            })
+            // Do not resurrect malformed or impersonated records written by
+            // older coordinators. A valid registration replaces these records.
+            .filter(|n| {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine};
+                let expected = B64
+                    .decode(&n.ed_pub)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .and_then(|key| wgmesh_core::keyderive::wg_pub_from_ed25519_pub(&key).ok());
+                expected.map(|k| B64.encode(k)).as_deref() == Some(n.wg_pubkey.as_str())
+                    && n.endpoints
+                        .iter()
+                        .all(|ep| wgmesh_wglink::validate_endpoint(ep).is_ok())
+            })
+            .map(|n| api::Peer {
+                hostname: n.hostname.clone(),
+                wg_public_key: n.wg_pubkey.clone(),
+                mesh_ip: n.mesh_ip.clone(),
+                endpoints: n.endpoints.clone(),
+                listen_port: n.listen_port,
+                last_seen: n.last_seen,
+            })
+            .collect();
+        peers.sort_by(|a, b| a.mesh_ip.cmp(&b.mesh_ip));
+        peers
     }
 
     /// `<mesh_ip>/<prefix_bits>` for an existing node, or `None`.
@@ -233,13 +268,7 @@ mod tests {
     fn allocates_stable_ip_across_reregister() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let s = Store::open(
-            path.to_str().unwrap(),
-            Ipv4Addr::new(10, 42, 0, 0),
-            16,
-            &[],
-        )
-        .unwrap();
+        let s = Store::open(path.to_str().unwrap(), Ipv4Addr::new(10, 42, 0, 0), 16, &[]).unwrap();
         let ip1 = s.upsert("eda", &req()).unwrap();
         let ip2 = s.upsert("eda", &req()).unwrap();
         assert_eq!(ip1, ip2);
@@ -265,13 +294,7 @@ mod tests {
     fn mesh_ip_cidr_includes_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let s = Store::open(
-            path.to_str().unwrap(),
-            Ipv4Addr::new(10, 42, 0, 0),
-            16,
-            &[],
-        )
-        .unwrap();
+        let s = Store::open(path.to_str().unwrap(), Ipv4Addr::new(10, 42, 0, 0), 16, &[]).unwrap();
         s.upsert("a", &req()).unwrap();
         let cidr = s.mesh_ip_cidr("a").unwrap();
         assert!(cidr.ends_with("/16"));
@@ -281,13 +304,7 @@ mod tests {
     fn peers_excludes_self() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let s = Store::open(
-            path.to_str().unwrap(),
-            Ipv4Addr::new(10, 42, 0, 0),
-            16,
-            &[],
-        )
-        .unwrap();
+        let s = Store::open(path.to_str().unwrap(), Ipv4Addr::new(10, 42, 0, 0), 16, &[]).unwrap();
         s.upsert("a", &req()).unwrap();
         s.upsert("b", &req()).unwrap();
         let p = s.peers("a", Duration::from_secs(600));
@@ -299,22 +316,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
-            let s = Store::open(
-                path.to_str().unwrap(),
-                Ipv4Addr::new(10, 42, 0, 0),
-                16,
-                &[],
-            )
-            .unwrap();
+            let s =
+                Store::open(path.to_str().unwrap(), Ipv4Addr::new(10, 42, 0, 0), 16, &[]).unwrap();
             s.upsert("a", &req()).unwrap();
         }
-        let s2 = Store::open(
-            path.to_str().unwrap(),
-            Ipv4Addr::new(10, 42, 0, 0),
-            16,
-            &[],
-        )
-        .unwrap();
+        let s2 = Store::open(path.to_str().unwrap(), Ipv4Addr::new(10, 42, 0, 0), 16, &[]).unwrap();
         assert!(s2.mesh_ip_cidr("a").is_some());
     }
 }

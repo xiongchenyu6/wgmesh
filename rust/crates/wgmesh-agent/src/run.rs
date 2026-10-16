@@ -1,9 +1,9 @@
 //! Main agent reconcile loop.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use std::collections::HashSet;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime};
 use tracing::{error, info, warn};
 use wgmesh_core::{api, keyderive, stun};
@@ -85,7 +85,6 @@ fn iterate(
             }
         }
     }
-    endpoints.sort();
 
     // 2. Register.
     let resp = cc.register(&api::RegisterRequest {
@@ -115,6 +114,16 @@ fn iterate(
         }
     }
 
+    // Resolve trusted coordinator hostnames before the strict WG boundary.
+    if let Some(r) = pr.relay.as_mut() {
+        let endpoint = crate::probe::format_wg_endpoint(&r.host, r.port);
+        let addr = endpoint
+            .to_socket_addrs()?
+            .next()
+            .context("no relay address")?;
+        r.host = addr.ip().to_string();
+    }
+
     // 4. Read kernel handshake state.
     let hs = wm.handshakes()?;
 
@@ -133,20 +142,13 @@ fn iterate(
     Ok(())
 }
 
-/// Try to bind the WG listen port for STUN; if that fails (kernel WG is
-/// already holding it), fall back to an ephemeral port. Mirrors the Go
-/// implementation's behavior.
+/// Never substitute an ephemeral socket's NAT mapping for the WG socket.
+/// On a running kernel interface binding normally fails; the coordinator
+/// supplies the endpoint observed from the real WG handshake instead.
 fn stun_on_port(server: &str, port: u16) -> Result<SocketAddr> {
-    match UdpSocket::bind(("0.0.0.0", port)) {
-        Ok(sock) => {
-            let addr = stun::discover_with_socket(server, &sock, Duration::from_secs(5))?;
-            Ok(addr)
-        }
-        Err(_) => {
-            let addr = stun::discover(server, Duration::from_secs(5))?;
-            Ok(addr)
-        }
-    }
+    let sock = UdpSocket::bind(("0.0.0.0", port))
+        .context("WG port unavailable for STUN; using relay-observed endpoints")?;
+    stun::discover_with_socket(server, &sock, Duration::from_secs(5)).map_err(Into::into)
 }
 
 /// Extract the host portion from `https://host[:port][/path]`. IPv6 hosts
@@ -220,5 +222,12 @@ mod tests {
     #[test]
     fn host_from_url_returns_none_when_scheme_missing() {
         assert_eq!(host_from_url("mesh.example.com:8443"), None);
+    }
+    #[test]
+    fn occupied_wg_port_never_falls_back_to_ephemeral_stun_socket() {
+        let occupied = UdpSocket::bind("0.0.0.0:0").unwrap();
+        // No server needs to exist: failure must occur at bind, before STUN.
+        let err = stun_on_port("127.0.0.1:9", occupied.local_addr().unwrap().port()).unwrap_err();
+        assert!(err.to_string().contains("WG port unavailable"));
     }
 }
