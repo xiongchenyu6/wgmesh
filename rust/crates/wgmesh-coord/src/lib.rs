@@ -49,9 +49,18 @@ pub async fn run(config_path: &str) -> Result<()> {
     {
         let signers = signers.clone();
         let relay = relay.clone();
+        let tls = tls.clone();
+        let cfg = cfg.clone();
         let mut hup = signal(SignalKind::hangup())?;
         tokio::spawn(async move {
             while hup.recv().await.is_some() {
+                // Keep the current valid certificate if renewal files are bad;
+                // signer revocation must still proceed independently.
+                if let Some(tls) = &tls {
+                    if let Err(e) = reload_tls(tls, &cfg).await {
+                        warn!("TLS reload failed (keeping current certificate): {e}");
+                    }
+                }
                 match signers.reload() {
                     Ok(()) => {
                         let relay = relay.clone();
@@ -115,6 +124,18 @@ pub async fn load_tls(
         }
         _ => anyhow::bail!("tls_cert and tls_key must be configured together"),
     }
+}
+
+pub async fn reload_tls(
+    tls: &axum_server::tls_rustls::RustlsConfig,
+    cfg: &config::Config,
+) -> Result<()> {
+    let cert = cfg.tls_cert.as_ref().context("missing tls_cert")?;
+    let key = cfg.tls_key.as_ref().context("missing tls_key")?;
+    tls.reload_from_pem_file(cert, key)
+        .await
+        .context("reload TLS certificate and key")?;
+    Ok(())
 }
 
 pub async fn serve(

@@ -158,14 +158,16 @@ live. Once a handshake lands, we promote to `/32` atomically.
 
 For direct HTTPS, provision a certificate and key and set the coordinator's
 `tlsCert` and `tlsKey` paths. Both are required together; invalid TLS files
-stop startup. With neither option set, the listener is plain HTTP and must
+stop startup. SIGHUP also reloads renewed certificate files; a failed renewal
+keeps the current valid certificate while signer revocation still proceeds.
+With neither option set, the listener is plain HTTP and must
 sit behind a TLS reverse proxy when agents use an HTTPS URL.
 
 Agents always initiate WG to the public hub. The hub publishes endpoints
 observed from completed WG handshakes, so discovery uses the actual WG UDP
-socket. No separate STUN service is needed. The optional `stunServer` setting
-only works when the WG port can be bound; it never advertises an ephemeral
-socket's mapping. Each direct candidate gets a 60-second probe window before
+socket. No separate STUN service is needed. `stunServer` is a deprecated
+compatibility option: leave it empty because running kernel WG owns that UDP
+port. An ephemeral socket's mapping is never advertised. Each direct candidate gets a 60-second probe window before
 the agent tries the next one, then falls back to the relay with backoff.
 
 Onboarding a new node is two declarative steps:
@@ -505,12 +507,12 @@ cd rust && cargo test --workspace
 | `wgmesh-core`         | 14    | api round-trip, sig sign/verify, keyderive invariants |
 | `wgmesh-core` (parity)| 1     | derived priv produces same pub as `wg pubkey` |
 | `wgmesh-wglink`       | 6     | syncconf rendering, `wg show dump` parsing |
-| `wgmesh-coord` (unit) | 12    | config defaults, store IP allocation/persistence |
+| `wgmesh-coord` (unit) | 13    | config defaults, store IP allocation/persistence |
 | `wgmesh-coord` (e2e)  | 8     | register, /peers, signer rejection, healthz |
-| `wgmesh-agent`        | 16     | probe state machine (all transitions), LAN filtering |
+| `wgmesh-agent`        | 18     | probe state machine (all transitions), LAN filtering |
 | `wgmesh-coord` (TLS)  | 2     | HTTPS handshake, plain HTTP rejection, invalid TLS config |
 | `ssh-to-wg`           | 6     | CLI argument parsing                    |
-| **Total**             | **65**|                                         |
+| **Total**             | **68**|                                         |
 
 Linux CI also builds the binaries and runs `sudo bash tests/kernel-mesh.sh`
 in isolated network namespaces, checking relay forwarding, direct promotion,
@@ -548,6 +550,9 @@ so a successful build means a complete artifact set.
   to `wg set private-key` and unlinked immediately after.
 - Coord auth is allowlist-only; there is no enrollment / OOB join flow. To
   add a node, append its `ssh-ed25519 …` line and SIGHUP.
+- Agents must reach the coordinator through trusted HTTPS. HTTP is available
+  as a backend for a trusted TLS proxy or isolated tests; request signatures
+  do not authenticate coordinator responses against a network attacker.
 - **The coordinator is trusted with relayed payloads.** Relay traffic is
   decrypted on the coordinator's WG interface, IP-forwarded, and encrypted
   again for the destination. Use application TLS/SSH for end-to-end privacy

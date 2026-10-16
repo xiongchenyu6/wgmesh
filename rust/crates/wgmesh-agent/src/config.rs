@@ -16,7 +16,8 @@ pub struct AgentConfig {
     #[arg(long = "coordinator", env = "WGMESH_COORDINATOR")]
     pub coordinator: String,
 
-    /// STUN server, e.g. `stun.example.com:3478`. Set empty/unset to skip.
+    /// Deprecated: leave empty. Running kernel WG owns this port; public
+    /// mappings are discovered from authenticated handshakes at the relay.
     #[arg(long = "stun", env = "WGMESH_STUN", default_value = "")]
     pub stun_server: String,
 

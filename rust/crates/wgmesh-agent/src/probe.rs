@@ -140,18 +140,18 @@ impl ProbeManager {
                     }
                 });
             entry.mesh_ip = p.mesh_ip.clone();
+            let mut unique = std::collections::HashSet::new();
             let candidates: Vec<_> = p
                 .endpoints
                 .iter()
-                .filter(|ep| wgmesh_wglink::validate_endpoint(ep).is_ok())
+                .filter(|ep| {
+                    wgmesh_wglink::validate_endpoint(ep).is_ok() && unique.insert((*ep).clone())
+                })
                 .cloned()
                 .collect();
             let selected = entry.endpoints.get(entry.candidate_index);
             let new_index = selected.and_then(|ep| candidates.iter().position(|v| v == ep));
-            if !entry.endpoints.is_empty()
-                && new_index.is_none()
-                && entry.state == ProbeState::Probing
-            {
+            if !candidates.is_empty() && new_index.is_none() && entry.state == ProbeState::Probing {
                 entry.probing_since = now;
             }
             entry.candidate_index = new_index.unwrap_or(0);
@@ -633,5 +633,37 @@ mod tests {
         )]);
         let (_, summary) = pm.reconcile(&[peer("A")], None, &hs, start + Duration::from_secs(1));
         assert_eq!(summary.direct, 1);
+    }
+    #[test]
+    fn duplicate_candidates_do_not_reset_probe_progress() {
+        let mut pm = ProbeManager::new();
+        let mut p = peer("A");
+        p.endpoints = vec![
+            "1.2.3.4:51820".into(),
+            "1.2.3.4:51820".into(),
+            "203.0.113.10:51820".into(),
+        ];
+        pm.reconcile(&[p.clone()], None, &HashMap::new(), unix(1_000_000));
+        pm.reconcile(&[p.clone()], None, &HashMap::new(), unix(1_000_061));
+        let (specs, _) = pm.reconcile(&[p], None, &HashMap::new(), unix(1_000_062));
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("203.0.113.10:51820")
+        );
+    }
+
+    #[test]
+    fn first_candidate_gets_a_new_probe_window() {
+        let mut pm = ProbeManager::new();
+        let mut p = peer("A");
+        p.endpoints.clear();
+        pm.reconcile(&[p.clone()], None, &HashMap::new(), unix(1_000_000));
+        p.endpoints.push("203.0.113.10:51820".into());
+        let (specs, sum) = pm.reconcile(&[p], None, &HashMap::new(), unix(1_000_090));
+        assert_eq!(sum.probing, 1);
+        assert_eq!(
+            find(&specs, "A").unwrap().endpoint.as_deref(),
+            Some("203.0.113.10:51820")
+        );
     }
 }

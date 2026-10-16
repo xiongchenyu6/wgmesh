@@ -28,6 +28,8 @@ async fn configured_certificate_serves_real_https_and_rejects_plain_http() {
         serde_json::json!({"tls_cert": cert_path, "tls_key": key_path}),
     );
     let tls = load_tls(&cfg).await.unwrap();
+    let tls_handle = tls.as_ref().unwrap().clone();
+    let renewed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -36,6 +38,7 @@ async fn configured_certificate_serves_real_https_and_rejects_plain_http() {
     let server = tokio::spawn(serve(listener, app, tls, handle.clone()));
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.cert.der().clone()).unwrap();
+    roots.add(renewed.cert.der().clone()).unwrap();
     let client = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -67,6 +70,33 @@ async fn configured_certificate_serves_real_https_and_rejects_plain_http() {
         .await
         .unwrap();
     assert!(result.is_err() || !String::from_utf8_lossy(&bytes).contains("200 OK"));
+    // SIGHUP uses this same reload helper; the live listener must present
+    // the renewed certificate without restarting or touching peer state.
+    std::fs::write(&cert_path, renewed.cert.pem()).unwrap();
+    std::fs::write(&key_path, renewed.key_pair.serialize_pem()).unwrap();
+    wgmesh_coord::reload_tls(&tls_handle, &cfg).await.unwrap();
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let renewed_stream = connector
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    assert_eq!(
+        &renewed_stream.get_ref().1.peer_certificates().unwrap()[0],
+        renewed.cert.der()
+    );
+    drop(renewed_stream);
+    std::fs::write(&key_path, "invalid renewal key").unwrap();
+    assert!(wgmesh_coord::reload_tls(&tls_handle, &cfg).await.is_err());
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let retained = connector
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    assert_eq!(
+        &retained.get_ref().1.peer_certificates().unwrap()[0],
+        renewed.cert.der()
+    );
+    drop(retained);
     handle.shutdown();
     server.await.unwrap().unwrap();
 }

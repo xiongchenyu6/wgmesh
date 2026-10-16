@@ -23,10 +23,10 @@ in
       default = "";
       example = "stun.example.com:3478";
       description = ''
-        Optional STUN server (host:port). Discovery requires binding the actual
-        WG port; occupied ports never fall back to an ephemeral socket.
-        Normally leave empty: the coordinator publishes endpoints observed
-        from authenticated WG handshakes in addition to LAN candidates.
+        Deprecated compatibility option: leave empty. Running kernel WG owns
+        its UDP port, so the agent uses endpoints observed from authenticated
+        WG handshakes at the coordinator in addition to LAN candidates.
+        Occupied ports never fall back to an ephemeral STUN socket.
       '';
     };
 

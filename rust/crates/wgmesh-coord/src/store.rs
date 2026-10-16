@@ -138,6 +138,10 @@ impl Store {
         let g = self.inner.lock().unwrap();
         let cutoff = Utc::now()
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let mut ip_counts = HashMap::new();
+        for node in g.nodes.values() {
+            *ip_counts.entry(&node.mesh_ip).or_insert(0usize) += 1;
+        }
         let mut peers: Vec<_> = g
             .nodes
             .values()
@@ -153,7 +157,23 @@ impl Store {
                     .ok()
                     .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
                     .and_then(|key| wgmesh_core::keyderive::wg_pub_from_ed25519_pub(&key).ok());
-                expected.map(|k| B64.encode(k)).as_deref() == Some(n.wg_pubkey.as_str())
+                let valid_ip = n.mesh_ip.parse::<Ipv4Addr>().ok().is_some_and(|ip| {
+                    let mask = if self.prefix_bits == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - self.prefix_bits)
+                    };
+                    let addr = u32::from(ip);
+                    (addr & mask) == self.network
+                        && addr != self.network
+                        && addr != (self.network | !mask)
+                        && !self.reserved.contains(&n.mesh_ip)
+                        && ip_counts.get(&n.mesh_ip) == Some(&1)
+                });
+                valid_ip
+                    && expected.map(|k| B64.encode(k)).as_deref() == Some(n.wg_pubkey.as_str())
+                    && n.listen_port != 0
+                    && n.endpoints.len() <= 32
                     && n.endpoints
                         .iter()
                         .all(|ep| wgmesh_wglink::validate_endpoint(ep).is_ok())
@@ -322,5 +342,67 @@ mod tests {
         }
         let s2 = Store::open(path.to_str().unwrap(), Ipv4Addr::new(10, 42, 0, 0), 16, &[]).unwrap();
         assert!(s2.mesh_ip_cidr("a").is_some());
+    }
+    #[test]
+    fn legacy_state_filters_invalid_routes_duplicate_ips_and_excess_endpoints() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[42; 32]).verifying_key();
+        let raw = B64.encode(ed.as_bytes());
+        let pk = ssh_key::PublicKey::new(
+            ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(*ed.as_bytes())),
+            "test",
+        );
+        let sp = dir.path().join("signers");
+        std::fs::write(&sp, pk.to_openssh().unwrap()).unwrap();
+        let signers = crate::signers::Signers::load(sp.to_str().unwrap()).unwrap();
+        let store = Store::open(
+            dir.path().join("state.json").to_str().unwrap(),
+            Ipv4Addr::new(10, 42, 0, 0),
+            16,
+            &["10.42.0.1"],
+        )
+        .unwrap();
+        let mut valid = req();
+        valid.wg_public_key =
+            B64.encode(wgmesh_core::keyderive::wg_pub_from_ed25519_pub(ed.as_bytes()).unwrap());
+        store.upsert(&raw, &valid).unwrap();
+        assert_eq!(
+            store
+                .authorized_peers("", Duration::from_secs(600), &signers)
+                .len(),
+            1
+        );
+        let original = store.inner.lock().unwrap().nodes[&raw].clone();
+        for ip in [
+            "garbage",
+            "192.0.2.1",
+            "10.42.0.0",
+            "10.42.255.255",
+            "10.42.0.1",
+        ] {
+            let mut node = original.clone();
+            node.mesh_ip = ip.into();
+            store.inner.lock().unwrap().nodes.insert(raw.clone(), node);
+            assert!(
+                store
+                    .authorized_peers("", Duration::from_secs(600), &signers)
+                    .is_empty(),
+                "accepted {ip}"
+            );
+        }
+        let mut node = original.clone();
+        node.endpoints = vec!["203.0.113.1:51820".into(); 33];
+        store.inner.lock().unwrap().nodes.insert(raw.clone(), node);
+        assert!(store
+            .authorized_peers("", Duration::from_secs(600), &signers)
+            .is_empty());
+        let mut g = store.inner.lock().unwrap();
+        g.nodes.insert(raw, original.clone());
+        g.nodes.insert("duplicate".into(), original);
+        drop(g);
+        assert!(store
+            .authorized_peers("", Duration::from_secs(600), &signers)
+            .is_empty());
     }
 }
