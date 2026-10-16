@@ -23,14 +23,11 @@
     # endpointHost = "wg.example.com";   # only if WG host ≠ HTTP host
     # wgListenPort = 51820;              # default
     # meshIP       = "10.42.0.1";        # default = first usable
+    # For direct HTTPS, provision these files (otherwise use a TLS reverse proxy):
+    # tlsCert = "/run/secrets/mesh-cert.pem";
+    # tlsKey  = "/run/secrets/mesh-key.pem";
     # listenAddr   = ":8443";            # default
   };
 
-  services.coturn = {
-    enable = true;
-    listening-port = 3478;
-    no-tls = true; no-dtls = true;
-    use-auth-secret = false; no-auth = true;   # STUN-only, no TURN auth
-  };
-  networking.firewall.allowedUDPPorts = [ 3478 ];
+  # Discovery uses real WG endpoints observed by this hub; no STUN server needed.
 }

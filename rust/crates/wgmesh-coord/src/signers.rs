@@ -50,21 +50,28 @@ impl Signers {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let raw = sig::ed_pub_b64_from_authorized_line(line).map_err(|e| {
-                SignersError::BadLine {
+            let raw =
+                sig::ed_pub_b64_from_authorized_line(line).map_err(|e| SignersError::BadLine {
                     path: self.path.clone(),
                     line: i + 1,
                     msg: e.to_string(),
-                }
-            })?;
+                })?;
             // Comment after the base64 blob is the third whitespace field, optional.
-            let comment: String = line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ");
+            let comment: String = line
+                .split_whitespace()
+                .skip(2)
+                .collect::<Vec<_>>()
+                .join(" ");
             new.insert(raw, comment);
         }
         let count = new.len();
         *self.inner.write().unwrap() = new;
         info!(count, path = %self.path, "authorized_signers loaded");
         Ok(())
+    }
+
+    pub fn snapshot(&self) -> std::collections::HashSet<String> {
+        self.inner.read().unwrap().keys().cloned().collect()
     }
 
     pub fn contains(&self, ed_pub_b64: &str) -> bool {

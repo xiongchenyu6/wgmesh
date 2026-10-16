@@ -23,9 +23,10 @@ in
       default = "";
       example = "stun.example.com:3478";
       description = ''
-        STUN server (host:port) used to discover the public UDP mapping for the
-        WG listen port. Leave empty to skip STUN (only LAN endpoints will be
-        advertised).
+        Deprecated compatibility option: leave empty. Running kernel WG owns
+        its UDP port, so the agent uses endpoints observed from authenticated
+        WG handshakes at the coordinator in addition to LAN candidates.
+        Occupied ports never fall back to an ephemeral STUN socket.
       '';
     };
 

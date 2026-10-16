@@ -10,7 +10,7 @@ append the host's public SSH line to the coord's allowlist — that's the entire
 onboarding. The whole thing is declarative, kernel-WireGuard-fast, and small
 enough to run on a 128 MB router. Written in Rust.
 
-[![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)](#tests)
+[![Tests](https://github.com/xiongchenyu6/wgmesh/actions/workflows/test.yml/badge.svg)](https://github.com/xiongchenyu6/wgmesh/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![NixOS](https://img.shields.io/badge/NixOS-first--class-5277c3)](#nixos-deployment)
 
@@ -141,9 +141,6 @@ live. Once a handshake lands, we promote to `/32` atomically.
     # (it's the host part of their `services.wgmesh.coordinator` URL),
     # and the WG port is published via /peers (default 51820).
   };
-  services.coturn = { enable = true; listening-port = 3478; no-tls = true;
-    no-dtls = true; use-auth-secret = false; no-auth = true; };
-  networking.firewall.allowedUDPPorts = [ 3478 ];
 }
 ```
 
@@ -155,10 +152,23 @@ live. Once a handshake lands, we promote to `/32` atomically.
   services.wgmesh = {
     enable      = true;
     coordinator = "https://mesh.example.com:8443";
-    stunServer  = "stun.example.com:3478";
   };
 }
 ```
+
+For direct HTTPS, provision a certificate and key and set the coordinator's
+`tlsCert` and `tlsKey` paths. Both are required together; invalid TLS files
+stop startup. SIGHUP also reloads renewed certificate files; a failed renewal
+keeps the current valid certificate while signer revocation still proceeds.
+With neither option set, the listener is plain HTTP and must
+sit behind a TLS reverse proxy when agents use an HTTPS URL.
+
+Agents always initiate WG to the public hub. The hub publishes endpoints
+observed from completed WG handshakes, so discovery uses the actual WG UDP
+socket. No separate STUN service is needed. `stunServer` is a deprecated
+compatibility option: leave it empty because running kernel WG owns that UDP
+port. An ephemeral socket's mapping is never advertised. Each direct candidate gets a 60-second probe window before
+the agent tries the next one, then falls back to the relay with backoff.
 
 Onboarding a new node is two declarative steps:
 
@@ -179,6 +189,11 @@ services.wgmesh-coord.authorizedSigners = [
 ```sh
 nixos-rebuild switch --flake .#coord --target-host coord.example.com
 ```
+
+Removing a signer rejects its API requests and excludes it from peer lists
+immediately after reload. The hub reconciles WG peers on reload; other online
+agents remove its direct peer on their next successful poll (normally 30 s).
+Offline agents retain their kernel peer configuration until they reconnect.
 
 The module re-renders `/etc/wgmesh/authorized_signers` and SIGHUPs coord
 automatically (`reloadTriggers`); the new node registers on its next
@@ -205,7 +220,7 @@ derivation, the probe state machine, and a real coord-server round-trip
 (register → /peers → re-register) end-to-end:
 
 ```sh
-cd rust && cargo test --workspace        # 44 tests pass
+cd rust && cargo test --workspace
 ```
 
 ---
@@ -228,7 +243,6 @@ flake. Here's a complete one-VPS-plus-N-agents setup:
       services.wgmesh = {
         enable      = true;
         coordinator = "https://mesh.example.com:8443";
-        stunServer  = "stun.example.com:3478";
       };
     };
     mkAgent = name: nixpkgs.lib.nixosSystem {
@@ -253,12 +267,6 @@ flake. Here's a complete one-VPS-plus-N-agents setup:
               ];
               openFirewall = true;
             };
-            services.coturn = {
-              enable = true; listening-port = 3478;
-              no-tls = true; no-dtls = true;
-              use-auth-secret = false; no-auth = true;
-            };
-            networking.firewall.allowedUDPPorts = [ 3478 ];
           }
         ];
       };
@@ -434,6 +442,11 @@ Every `/register` and `/peers` request carries three headers:
 | `X-Sig-Pubkey`      | OpenSSH `authorized_keys` line                 |
 | `X-Sig-Signature`   | base64 ed25519 signature over the canonical    |
 
+Registration binds `wg_public_key` to the X25519 conversion of the authenticated
+SSH public key; `ssh_public_key` must identify the same signer. Endpoints must
+be numeric IPv4/IPv6 socket addresses with nonzero ports (at most 32 per node).
+Invalid registrations are rejected before updating persisted or kernel state.
+
 Canonical bytes:
 
 ```
@@ -491,13 +504,19 @@ cd rust && cargo test --workspace
 
 | Suite                 | Tests | What                                    |
 |-----------------------|-------|-----------------------------------------|
-| `wgmesh-core`         | 13    | api round-trip, sig sign/verify, keyderive invariants |
+| `wgmesh-core`         | 14    | api round-trip, sig sign/verify, keyderive invariants |
 | `wgmesh-core` (parity)| 1     | derived priv produces same pub as `wg pubkey` |
-| `wgmesh-wglink`       | 4     | syncconf rendering, `wg show dump` parsing |
-| `wgmesh-coord` (unit) | 11    | config defaults, store IP allocation/persistence |
-| `wgmesh-coord` (e2e)  | 5     | register, /peers, signer rejection, healthz |
-| `wgmesh-agent`        | 9     | probe state machine (all transitions), LAN filtering |
-| **Total**             | **43**|                                         |
+| `wgmesh-wglink`       | 6     | syncconf rendering, `wg show dump` parsing |
+| `wgmesh-coord` (unit) | 13    | config defaults, store IP allocation/persistence |
+| `wgmesh-coord` (e2e)  | 8     | register, /peers, signer rejection, healthz |
+| `wgmesh-agent`        | 18     | probe state machine (all transitions), LAN filtering |
+| `wgmesh-coord` (TLS)  | 2     | HTTPS handshake, plain HTTP rejection, invalid TLS config |
+| `ssh-to-wg`           | 6     | CLI argument parsing                    |
+| **Total**             | **68**|                                         |
+
+Linux CI also builds the binaries and runs `sudo bash tests/kernel-mesh.sh`
+in isolated network namespaces, checking relay forwarding, direct promotion,
+and removal of real kernel peers after signer revocation.
 
 The `keyderive_wg_parity` test pipes a derived private key through
 `wg pubkey` and asserts the result equals our derived public — the kernel
@@ -531,9 +550,13 @@ so a successful build means a complete artifact set.
   to `wg set private-key` and unlinked immediately after.
 - Coord auth is allowlist-only; there is no enrollment / OOB join flow. To
   add a node, append its `ssh-ed25519 …` line and SIGHUP.
-- The coord sees relayed traffic patterns (which pair of nodes is
-  exchanging traffic, how much). WG encryption guarantees coord can't read
-  payloads. Direct-connected pairs bypass coord entirely.
+- Agents must reach the coordinator through trusted HTTPS. HTTP is available
+  as a backend for a trusted TLS proxy or isolated tests; request signatures
+  do not authenticate coordinator responses against a network attacker.
+- **The coordinator is trusted with relayed payloads.** Relay traffic is
+  decrypted on the coordinator's WG interface, IP-forwarded, and encrypted
+  again for the destination. Use application TLS/SSH for end-to-end privacy
+  from the coordinator. Direct-connected pairs bypass the coordinator.
 - Replays are bounded by the ±60 s timestamp window. `/register` is
   idempotent; `/peers` is a read. No nonce store on coord.
 
@@ -565,8 +588,9 @@ so a successful build means a complete artifact set.
 
 ## Roadmap
 
-- Coordinated UDP hole-punching for symmetric NATs (currently relies on
-  PersistentKeepalive + STUN, which works for cone NATs but not symmetric).
+- Coordinated UDP hole-punching for endpoint-dependent NATs. Current discovery
+  uses endpoints observed from authenticated WG handshakes at the hub; such
+  mappings may work for endpoint-independent NATs, with relay fallback otherwise.
 - ACME / Let's Encrypt integration in the coord NixOS module.
 - TURN fallback for nodes that can't even reach the coord WG endpoint.
 

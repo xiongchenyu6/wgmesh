@@ -129,9 +129,6 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
     # （它就是 agent 自己 services.wgmesh.coordinator URL 里的 host），
     # WG 端口由 coord 通过 /peers 广播（默认 51820）。
   };
-  services.coturn = { enable = true; listening-port = 3478; no-tls = true;
-    no-dtls = true; use-auth-secret = false; no-auth = true; };
-  networking.firewall.allowedUDPPorts = [ 3478 ];
 }
 ```
 
@@ -143,7 +140,6 @@ PROBING 状态下 `AllowedIPs` 留空是关键：内核仍然会尝试握手，
   services.wgmesh = {
     enable      = true;
     coordinator = "https://mesh.example.com:8443";
-    stunServer  = "stun.example.com:3478";
   };
 }
 ```
@@ -214,7 +210,6 @@ cd rust && cargo test --workspace        # 44 个测试通过
       services.wgmesh = {
         enable      = true;
         coordinator = "https://mesh.example.com:8443";
-        stunServer  = "stun.example.com:3478";
       };
     };
     mkAgent = name: nixpkgs.lib.nixosSystem {
@@ -239,12 +234,6 @@ cd rust && cargo test --workspace        # 44 个测试通过
               ];
               openFirewall = true;
             };
-            services.coturn = {
-              enable = true; listening-port = 3478;
-              no-tls = true; no-dtls = true;
-              use-auth-secret = false; no-auth = true;
-            };
-            networking.firewall.allowedUDPPorts = [ 3478 ];
           }
         ];
       };
@@ -500,8 +489,11 @@ flake 的 `postInstall` 会断言每个预期的二进制都进了 `$out/bin/`�
   本身从不把私钥落盘。
 - 协调器只认允许列表；没有自助接入流程也没有带外签发。加节点就是追加
   `ssh-ed25519 …` 一行 + SIGHUP。
-- 协调器看得到中继流量的元数据（哪一对节点在传、传了多少）。WG 加密保证它
-  读不到载荷。直连的节点对完全绕开协调器。
+- Agent 必须通过可信 HTTPS 访问协调器。HTTP 仅供可信 TLS 反向代理后端或
+  隔离测试使用；请求签名不能防止网络攻击者伪造协调器响应。
+- **协调器是中继数据的受信任方，能够读取中继载荷。** 中继流量在协调器 WG
+  接口解密，经 IP 转发后重新加密给目标节点。若需对协调器保密，请使用应用层
+  TLS/SSH。直连的节点对完全绕开协调器。
 - 重放攻击被 ±60s 时间戳窗口限定。`/register` 幂等，`/peers` 只读。
   协调器不存 nonce。
 
@@ -529,8 +521,8 @@ flake 的 `postInstall` 会断言每个预期的二进制都进了 `$out/bin/`�
 
 ## 路线图
 
-- 协调式 UDP 打洞，应对对称 NAT（目前依赖 PersistentKeepalive + STUN，
-  锥形 NAT 没问题但对称 NAT 不行）。
+- 协调式 UDP 打洞，应对端点相关 NAT。目前使用协调器从真实 WG 握手观察到的端点，
+  可能适用于端点无关 NAT；其余情况走中继兜底。
 - 协调器的 NixOS 模块加 ACME / Let's Encrypt 集成。
 - TURN 兜底，给连协调器 WG 端点都不通的节点用。
 
@@ -544,3 +536,19 @@ MIT。详见 `LICENSE`。
 [ed25519-dalek](https://github.com/dalek-cryptography/ed25519-dalek)、
 [axum](https://github.com/tokio-rs/axum) 以及 Nix 社区 WireGuard 内核模块
 工作的肩膀上。
+
+### 连接发现、TLS 与授权撤销
+
+协调器从已完成认证的 WireGuard 握手读取节点真实 UDP 端点，并在 `/peers`
+中发布。无需额外部署 STUN。`stunServer` 是已弃用的兼容选项，应留空，因为
+运行中的内核 WG 已占用该端口；不会用临时 socket 的映射替代。Agent 为每个候选地址保留 60 秒
+探测时间，失败后尝试下一个，全部失败才退避并走中继。成功后保留 WG 学到的
+roaming 地址。
+
+直接使用 HTTPS 时，必须提供 `tlsCert` 和 `tlsKey`。两者必须同时配置，证书
+加载失败会终止启动。SIGHUP 同时重新加载续期证书；续期文件无效时保留当前
+证书，并继续处理授权撤销。均未设置时服务提供 HTTP，HTTPS 入口需由反向代理提供。
+
+删除授权并重载后，节点的 API 请求立即被拒绝，并从 peer 列表中排除。协调器
+在重载时同步清理 WG peer；其他在线 agent 在下一次成功轮询时删除直连 peer，
+通常不超过 30 秒。离线 agent 在重新连接前仍保留内核中的 peer 配置。
