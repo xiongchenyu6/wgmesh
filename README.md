@@ -504,13 +504,13 @@ cd rust && cargo test --workspace
 |-----------------------|-------|-----------------------------------------|
 | `wgmesh-core`         | 14    | api round-trip, sig sign/verify, keyderive invariants |
 | `wgmesh-core` (parity)| 1     | derived priv produces same pub as `wg pubkey` |
-| `wgmesh-wglink`       | 5     | syncconf rendering, `wg show dump` parsing |
+| `wgmesh-wglink`       | 6     | syncconf rendering, `wg show dump` parsing |
 | `wgmesh-coord` (unit) | 12    | config defaults, store IP allocation/persistence |
 | `wgmesh-coord` (e2e)  | 8     | register, /peers, signer rejection, healthz |
 | `wgmesh-agent`        | 16     | probe state machine (all transitions), LAN filtering |
 | `wgmesh-coord` (TLS)  | 2     | HTTPS handshake, plain HTTP rejection, invalid TLS config |
 | `ssh-to-wg`           | 6     | CLI argument parsing                    |
-| **Total**             | **64**|                                         |
+| **Total**             | **65**|                                         |
 
 Linux CI also builds the binaries and runs `sudo bash tests/kernel-mesh.sh`
 in isolated network namespaces, checking relay forwarding, direct promotion,

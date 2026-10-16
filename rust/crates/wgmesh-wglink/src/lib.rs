@@ -156,7 +156,19 @@ impl Manager {
     /// Atomically replace the device's full peer set with `peers`.
     pub fn replace_peers(&self, peers: &[PeerSpec]) -> Result<(), WgError> {
         validate_peers(peers)?;
-        let conf = render_syncconf(peers);
+        // syncconf resets omitted device fields. Carry the trusted current
+        // [Interface] section forward, including the key, port and fwmark.
+        let current = Command::new("wg")
+            .args(["showconf", &self.iface])
+            .output()?;
+        if !current.status.success() {
+            return Err(WgError::Exit {
+                cmd: format!("wg showconf {}", self.iface),
+                code: current.status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&current.stderr).into_owned(),
+            });
+        }
+        let conf = render_device_syncconf(&String::from_utf8_lossy(&current.stdout), peers);
         debug!(iface = %self.iface, peers = peers.len(), "syncconf");
         let path = tempfile_with_mode(conf.as_bytes(), 0o600)?;
         let res = run(
@@ -268,16 +280,31 @@ pub fn is_root() -> bool {
         .unwrap_or(false)
 }
 
-/// Format a wg syncconf-compatible configuration. We omit `[Interface]`
-/// because we configure the device-level state separately via `wg set`;
-/// syncconf accepts a peer-only file and replaces the peer table from it.
+/// Retain device configuration while replacing the entire desired peer list.
+/// The returned configuration contains a private key: never log it.
+pub fn render_device_syncconf(current: &str, peers: &[PeerSpec]) -> String {
+    let mut out = current
+        .lines()
+        .take_while(|line| line.trim() != "[Peer]")
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    out.push_str(&render_syncconf(peers));
+    out
+}
+
+/// Render the peer fragment of a syncconf configuration. Manager combines
+/// this with the current device section before applying it.
 pub fn render_syncconf(peers: &[PeerSpec]) -> String {
     let mut out = String::new();
     for p in peers {
         out.push_str("[Peer]\n");
         out.push_str(&format!("PublicKey = {}\n", p.pub_key_b64));
-        // AllowedIPs may be empty (PROBING). wg(8) accepts an empty list.
-        out.push_str(&format!("AllowedIPs = {}\n", p.allowed_ips.join(", ")));
+        // A missing AllowedIPs field means an empty replacement list in a
+        // syncconf peer section. An explicit empty assignment is rejected by wg.
+        if !p.allowed_ips.is_empty() {
+            out.push_str(&format!("AllowedIPs = {}\n", p.allowed_ips.join(", ")));
+        }
         if let Some(ep) = &p.endpoint {
             out.push_str(&format!("Endpoint = {ep}\n"));
         }
@@ -378,8 +405,8 @@ mod tests {
         assert!(cfg.contains("[Peer]"));
         assert!(cfg.contains("PublicKey = AAAA"));
         assert!(
-            cfg.contains("AllowedIPs = \n"),
-            "expected empty AllowedIPs, got:\n{cfg}"
+            !cfg.contains("AllowedIPs"),
+            "empty assignment is not valid wg config: {cfg}"
         );
         assert!(cfg.contains("Endpoint = 1.2.3.4:51820"));
         assert!(cfg.contains("PersistentKeepalive = 25"));
@@ -445,5 +472,23 @@ mod tests {
             ));
         }
         assert!(validate_peers(&[valid.clone(), valid]).is_err());
+    }
+    #[test]
+    fn peer_replacement_preserves_device_identity_port_and_fwmark() {
+        let current = "[Interface]\nPrivateKey = SECRET\nListenPort = 51820\nFwMark = 0x123\n\n[Peer]\nPublicKey = OLD\nAllowedIPs = 10.42.0.2/32\n";
+        let peer = PeerSpec {
+            pub_key_b64: "NEW".into(),
+            endpoint: None,
+            allowed_ips: vec![],
+            keepalive_secs: Some(25),
+        };
+        let conf = render_device_syncconf(current, &[peer]);
+        assert!(conf.contains("PrivateKey = SECRET\nListenPort = 51820\nFwMark = 0x123"));
+        assert!(conf.contains("PublicKey = NEW"));
+        assert!(!conf.contains("OLD"));
+        assert!(!conf.contains("AllowedIPs"));
+        let conf = render_device_syncconf(current, &[]);
+        assert!(conf.contains("PrivateKey = SECRET"));
+        assert!(!conf.contains("[Peer]"));
     }
 }

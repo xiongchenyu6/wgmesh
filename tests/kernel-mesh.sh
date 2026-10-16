@@ -62,7 +62,12 @@ a_key=$("$bin/ssh-to-wg" < "$work/a.pub")
 b_key=$("$bin/ssh-to-wg" < "$work/b.pub")
 ping_b() { ip netns exec "$prefix-a" ping -c 1 -W 1 "$b_ip" > /dev/null; }
 wait_for 10 ping_b
-echo 'Relay forwarding works while direct endpoints are blocked'
+for node in hub a b; do
+  expected=$("$bin/ssh-to-wg" < "$work/$node.pub")
+  [[ $(ip netns exec "$prefix-$node" wg show wg0 public-key) == "$expected" ]]
+  [[ $(ip netns exec "$prefix-$node" wg show wg0 listen-port) == 51820 ]]
+done
+echo 'Relay forwarding works while direct endpoints are blocked; interface identity is preserved'
 ip netns exec "$prefix-a" iptables -F OUTPUT
 ip netns exec "$prefix-b" iptables -F OUTPUT
 direct() {
