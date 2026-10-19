@@ -169,6 +169,11 @@ socket. No separate STUN service is needed. `stunServer` is a deprecated
 compatibility option: leave it empty because running kernel WG owns that UDP
 port. An ephemeral socket's mapping is never advertised. Each direct candidate gets a 60-second probe window before
 the agent tries the next one, then falls back to the relay with backoff.
+To keep unreachable addresses out of that list, `services.wgmesh.skipInterfaces`
+(default: `lo`, `docker*`, `br-*`, `veth*`, `virbr*`, `podman*`, `wt*`,
+`tailscale*`, `zt*`) excludes interfaces from LAN candidates: an entry ending
+in `*` is a prefix match, anything else is an exact name. The agent's own
+interface is always skipped.
 
 Onboarding a new node is two declarative steps:
 
@@ -306,6 +311,28 @@ Adding a new node later: `nixos-rebuild` the node, append a line to
 `authorizedSigners`, `nixos-rebuild` the coord. **There is no other
 state.** Lose the coord VPS? Restore `/var/lib/wgmesh-coord/state.json`
 from backup; mesh IPs come back stable.
+
+### Pinning mesh IPs in git
+
+By default mesh IPs are handed out in registration order and kept in
+`state.json`. To pin a node's IP in your flake instead, map the IP to the
+node's host public key on the coord:
+
+```nix
+services.wgmesh-coord.staticIPs = {
+  "10.42.0.10" = "ssh-ed25519 AAAA... node-a";   # comment is ignored
+};
+```
+
+Only key type and base64 are matched. Each IP must be inside `meshCidr` and
+not the network, broadcast or coordinator address; each key may appear once
+(otherwise the coord refuses to start). Pinned IPs are never handed out
+dynamically. A pinned node gets its IP on its next register (every poll) even
+if `state.json` gave it another; a node that held the pinned IP is moved to a
+fresh one. Edits are applied on reload (SIGHUP, automatic on `nixos-rebuild`);
+a config that fails validation on reload is logged and the previous
+reservations stay in force. The agent swaps its wg0 address when the IP
+changes.
 
 ---
 
@@ -507,12 +534,12 @@ cd rust && cargo test --workspace
 | `wgmesh-core`         | 14    | api round-trip, sig sign/verify, keyderive invariants |
 | `wgmesh-core` (parity)| 1     | derived priv produces same pub as `wg pubkey` |
 | `wgmesh-wglink`       | 6     | syncconf rendering, `wg show dump` parsing |
-| `wgmesh-coord` (unit) | 13    | config defaults, store IP allocation/persistence |
-| `wgmesh-coord` (e2e)  | 8     | register, /peers, signer rejection, healthz |
-| `wgmesh-agent`        | 18     | probe state machine (all transitions), LAN filtering |
+| `wgmesh-coord` (unit) | 22    | config defaults/`static_ips` validation, store IP allocation/persistence/reservations, reload |
+| `wgmesh-coord` (e2e)  | 9     | register, /peers, signer rejection, healthz, reserved IPs |
+| `wgmesh-agent`        | 21     | probe state machine (all transitions), LAN filtering, skip-interface matching |
 | `wgmesh-coord` (TLS)  | 2     | HTTPS handshake, plain HTTP rejection, invalid TLS config |
 | `ssh-to-wg`           | 6     | CLI argument parsing                    |
-| **Total**             | **68**|                                         |
+| **Total**             | **81**|                                         |
 
 Linux CI also builds the binaries and runs `sudo bash tests/kernel-mesh.sh`
 in isolated network namespaces, checking relay forwarding, direct promotion,

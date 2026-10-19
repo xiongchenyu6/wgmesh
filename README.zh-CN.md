@@ -273,6 +273,24 @@ nixos-rebuild switch --flake .#coord --target-host coord.example.com
 **整套系统没有别的状态。** 协调器 VPS 挂了？从备份还原
 `/var/lib/wgmesh-coord/state.json`，mesh IP 自动还是原来的。
 
+### 在 git 里固定 mesh IP
+
+默认 mesh IP 按注册顺序分配并记在 `state.json`。想把某节点的 IP 固定在
+flake 里，在 coord 上写「IP → 该节点 host 公钥」：
+
+```nix
+services.wgmesh-coord.staticIPs = {
+  "10.42.0.10" = "ssh-ed25519 AAAA... node-a";   # 注释会被忽略
+};
+```
+
+只匹配密钥类型和 base64。每个 IP 必须在 `meshCidr` 内，且不能是网络地址、
+广播地址或 coord 自己的地址；同一公钥只能出现一次（否则 coord 拒绝启动）。
+固定的 IP 不会再被动态分配。持有固定 IP 的节点在下次注册（每次轮询）时拿到
+该 IP，即使 `state.json` 里原本给了别的；原先占用该 IP 的节点会被换到新 IP。
+改动在 reload（SIGHUP，`nixos-rebuild` 时自动触发）后生效；reload 时配置校验
+失败会记日志并保留旧的预留。IP 变化时 agent 会替换 wg0 上的地址。
+
 ---
 
 ## 横向对比
@@ -450,13 +468,15 @@ cd rust && cargo test --workspace
 
 | 测试集                  | 用例数 | 测试什么                                     |
 |-------------------------|--------|----------------------------------------------|
-| `wgmesh-core`           | 13     | API 序列化、sig 签名/验证、keyderive 不变量    |
+| `wgmesh-core`           | 14     | API 序列化、sig 签名/验证、keyderive 不变量    |
 | `wgmesh-core` (parity)  | 1      | 推导出的私钥经 `wg pubkey` 算出的公钥与本实现一致 |
-| `wgmesh-wglink`         | 4      | syncconf 配置渲染、`wg show dump` 解析        |
-| `wgmesh-coord` (单元)   | 11     | 配置默认值、Store 的 IP 分配/持久化           |
-| `wgmesh-coord` (集成)   | 5      | register、/peers、未授权拒绝、healthz         |
-| `wgmesh-agent`          | 9      | 探测状态机所有跳转、LAN 端点过滤              |
-| **总计**                | **43** |                                              |
+| `wgmesh-wglink`         | 6      | syncconf 配置渲染、`wg show dump` 解析        |
+| `wgmesh-coord` (单元)   | 22     | 配置默认值与 `static_ips` 校验、Store 的 IP 分配/持久化/预留、reload |
+| `wgmesh-coord` (集成)   | 9      | register、/peers、未授权拒绝、healthz、预留 IP |
+| `wgmesh-agent`          | 21     | 探测状态机所有跳转、LAN 端点过滤、skip 接口匹配 |
+| `wgmesh-coord` (TLS)    | 2      | HTTPS 握手、拒绝明文 HTTP、无效 TLS 配置       |
+| `ssh-to-wg`             | 6      | CLI 参数解析                                  |
+| **总计**                | **81** |                                              |
 
 `keyderive_wg_parity` 测试把推导的私钥喂给 `wg pubkey`，断言结果等于本实现
 推导出的公钥——把内核 WireGuard 工具本身当作权威。`wg`/`ssh-keygen`
@@ -543,7 +563,10 @@ MIT。详见 `LICENSE`。
 中发布。无需额外部署 STUN。`stunServer` 是已弃用的兼容选项，应留空，因为
 运行中的内核 WG 已占用该端口；不会用临时 socket 的映射替代。Agent 为每个候选地址保留 60 秒
 探测时间，失败后尝试下一个，全部失败才退避并走中继。成功后保留 WG 学到的
-roaming 地址。
+roaming 地址。为避免把不可达地址放进候选列表，`services.wgmesh.skipInterfaces`
+（默认：`lo`、`docker*`、`br-*`、`veth*`、`virbr*`、`podman*`、`wt*`、
+`tailscale*`、`zt*`）会把这些接口从 LAN 候选中排除：以 `*` 结尾的条目是前缀
+匹配，其余为精确匹配；agent 自己的接口始终被跳过。
 
 直接使用 HTTPS 时，必须提供 `tlsCert` 和 `tlsKey`。两者必须同时配置，证书
 加载失败会终止启动。SIGHUP 同时重新加载续期证书；续期文件无效时保留当前

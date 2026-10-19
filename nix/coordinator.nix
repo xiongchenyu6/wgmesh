@@ -23,6 +23,8 @@ let
     wg_listen_port     = cfg.wgListenPort;
     wg_endpoint_host   = cfg.endpointHost;
     wg_mesh_ip         = cfg.meshIP;
+  } // lib.optionalAttrs (cfg.staticIPs != {}) {
+    static_ips         = cfg.staticIPs;
   };
   configFile = pkgs.writeText "wgmesh-coord.json" (builtins.toJSON configAttrs);
 
@@ -81,6 +83,25 @@ in
         Paths to OpenSSH `.pub` files; their contents are concatenated
         with `authorizedSigners` into the rendered allowlist. Useful when
         per-node pubkeys live in their own files in the flake.
+      '';
+    };
+
+    staticIPs = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = {};
+      example = {
+        "10.42.0.10" = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...AAA node-a";
+      };
+      description = ''
+        Pin mesh IPs: attribute name = mesh IP, value = the node's OpenSSH
+        public key line (only key type + base64 are matched; the comment is
+        ignored). Each IP must lie inside `meshCidr`, not be the network,
+        broadcast or coordinator address, and each key may appear once.
+        Pinned IPs are never handed out dynamically; a pinned node gets its
+        IP on its next register even if it previously held another one (a
+        node that held the pinned IP is moved to a fresh one). Changes are
+        applied on reload (SIGHUP via `reloadTriggers`); an invalid config
+        on reload is logged and the previous reservations are kept.
       '';
     };
 

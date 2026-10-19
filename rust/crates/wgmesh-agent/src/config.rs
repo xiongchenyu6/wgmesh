@@ -42,6 +42,7 @@ pub struct AgentConfig {
     pub include_lan: bool,
 
     /// Comma-separated interface names to skip when enumerating LAN endpoints.
+    /// An entry ending in `*` is a prefix match (`br-*`); others are exact.
     #[arg(long = "skip-iface", env = "WGMESH_SKIP_IFACE", value_delimiter = ',')]
     pub skip_iface: Vec<String>,
 }

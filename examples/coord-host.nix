@@ -19,6 +19,9 @@
       # "ssh-ed25519 AAAA... node-a"
       # "ssh-ed25519 AAAA... node-b"
     ];
+    # Pin a node's mesh IP in git (IP -> its host pubkey; comment ignored).
+    # The key must also be in authorizedSigners.
+    # staticIPs = { "10.42.0.10" = "ssh-ed25519 AAAA... node-a"; };
     openFirewall = true;
     # endpointHost = "wg.example.com";   # only if WG host ≠ HTTP host
     # wgListenPort = 51820;              # default
