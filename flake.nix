@@ -1,5 +1,5 @@
 {
-  description = "wgmesh: kernel-WireGuard full mesh for NixOS from stock modules (wireguard + wgautomesh)";
+  description = "wgmesh: WireGuard full mesh for NixOS and nix-darwin from stock modules (wireguard + wgautomesh)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -13,6 +13,7 @@
     in
     {
       nixosModules.default = ./nix/module.nix;
+      darwinModules.default = ./nix/darwin.nix;
 
       checks = forAllSystems (system: {
         vm = import ./tests/vm.nix {

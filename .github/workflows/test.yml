@@ -20,6 +20,6 @@ jobs:
         with:
           extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
       - name: Format
-        run: nix run nixpkgs#nixfmt -- --check flake.nix nix/module.nix tests/vm.nix
+        run: nix run nixpkgs#nixfmt -- --check flake.nix nix/*.nix tests/vm.nix
       - name: Four-node mesh VM test
         run: nix flake check -L
