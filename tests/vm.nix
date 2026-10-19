@@ -85,7 +85,11 @@ pkgs.testers.runNixOSTest {
     ];
     a = node "a" [ 1 ];
     b = node "b" [ 2 ];
-    c = node "c" [ 1 ];
+    # c builds its interface through networkd, the others through scripts.
+    c = {
+      imports = [ (node "c" [ 1 ]) ];
+      networking.useNetworkd = true;
+    };
   };
   testScript = ''
     start_all()

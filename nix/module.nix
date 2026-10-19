@@ -153,9 +153,10 @@ in
       # The stock unit runs pkgs.wgautomesh; with gossip encryption on, its
       # rendered config always lives at this runtime path.
       serviceConfig.ExecStart = lib.mkForce "${lib.getExe cfg.package} /run/wgautomesh/wgautomesh.toml";
-      requires = [ "wireguard-${cfg.interface}.service" ];
-      after = [ "wireguard-${cfg.interface}.service" ];
-      partOf = [ "wireguard-${cfg.interface}.service" ];
+      # The device unit exists whichever backend (scripted or networkd)
+      # networking.wireguard uses to create the interface.
+      bindsTo = [ "sys-subsystem-net-devices-${cfg.interface}.device" ];
+      after = [ "sys-subsystem-net-devices-${cfg.interface}.device" ];
     };
   };
 }
