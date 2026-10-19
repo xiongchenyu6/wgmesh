@@ -134,7 +134,7 @@ in
     };
 
     networking.firewall.allowedUDPPorts = [ cfg.listenPort ];
-    boot.kernel.sysctl."net.ipv4.ip_forward" = mkIf isRelay 1;
+    boot.kernel.sysctl."net.ipv4.ip_forward" = mkIf isRelay (lib.mkDefault 1);
 
     services.wgautomesh = {
       enable = true;
