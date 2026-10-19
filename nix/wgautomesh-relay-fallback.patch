@@ -1,0 +1,59 @@
+diff --git a/src/main.rs b/src/main.rs
+index 88336f4..bf040ba 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -49,6 +49,12 @@ struct Config {
+     /// Forward an external port to Wiregard using UPnP IGD
+     upnp_forward_external_port: Option<u16>,
+ 
++    /// Only route a peer's address to it while its handshake is fresh, so a
++    /// peer we cannot reach directly falls back to a covering route on a
++    /// statically configured relay peer (e.g. the hub's whole mesh prefix).
++    #[serde(default)]
++    relay_fallback: bool,
++
+     /// The list of peers we try to connect to
+     #[serde(default)]
+     peers: Vec<Peer>,
+@@ -610,12 +616,23 @@ impl State {
+                             &peer_cfg.pubkey,
+                             "persistent-keepalive",
+                             "30",
++                            "allowed-ips",
++                            &format!("{}/32", peer_cfg.address),
+                         ])
+                         .output()?;
+                     continue;
+                 }
+             }
+ 
++            // Disconnected peers keep their /32 unless relay fallback is on, in
++            // which case traffic to them takes the relay's covering route until
++            // a handshake succeeds (keepalives still drive handshake attempts).
++            let disconnected_allowed_ips = if daemon.config.relay_fallback {
++                String::new()
++            } else {
++                format!("{}/32", peer_cfg.address)
++            };
++
+             // For disconnected peers, cycle through the endpoint addresses that we know of
+             let lan_endpoint = self
+                 .peers
+@@ -670,7 +687,7 @@ impl State {
+                         "persistent-keepalive",
+                         "10",
+                         "allowed-ips",
+-                        &format!("{}/32", peer_cfg.address),
++                        &disconnected_allowed_ips,
+                     ])
+                     .output()?;
+                 let packet = daemon.make_packet(&Gossip::Ping)?;
+@@ -687,7 +704,7 @@ impl State {
+                         "peer",
+                         &peer_cfg.pubkey,
+                         "allowed-ips",
+-                        &format!("{}/32", peer_cfg.address),
++                        &disconnected_allowed_ips,
+                     ])
+                     .output()?;
+             }
