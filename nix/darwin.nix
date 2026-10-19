@@ -67,12 +67,18 @@ in
 
     environment.systemPackages = [ pkgs.wireguard-tools ];
 
-    # wgautomesh drives the interface through `wg`, which finds the utun
-    # behind the name in /var/run/wireguard.
+    # Only wg-quick maps the interface name to its utun; `wg` itself needs the
+    # utun name. A restarted tunnel gets a new utun, wgautomesh then fails on
+    # `wg show` and launchd starts it again with the new name.
     launchd.daemons.wgautomesh.serviceConfig = {
       ProgramArguments = [
-        wgautomesh
-        "${settings}"
+        "/bin/sh"
+        "-c"
+        ''
+          utun=$(cat /var/run/wireguard/${cfg.interface}.name) || exit 1
+          sed "s/^interface = .*/interface = \"$utun\"/" ${settings} > /var/run/wgautomesh.toml
+          exec ${wgautomesh} /var/run/wgautomesh.toml
+        ''
       ];
       EnvironmentVariables = {
         PATH = "${pkgs.wireguard-tools}/bin:/usr/bin:/bin:/usr/sbin:/sbin";
