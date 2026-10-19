@@ -7,7 +7,7 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 use wgmesh_core::api;
@@ -46,6 +46,8 @@ pub struct Store {
     network: u32,
     prefix_bits: u8,
     reserved: HashSet<String>,
+    /// Pinned IPs from config: raw ed25519 key (base64) → mesh IP.
+    static_ips: RwLock<HashMap<String, String>>,
     inner: Mutex<StateFile>,
 }
 
@@ -76,17 +78,47 @@ impl Store {
             network: u32::from(network),
             prefix_bits,
             reserved: reserved.iter().map(|s| (*s).to_string()).collect(),
+            static_ips: RwLock::new(HashMap::new()),
             inner: Mutex::new(state),
         };
         s.persist()?;
         Ok(s)
     }
 
+    /// Replace the pinned-IP table. Takes effect on each node's next `upsert`.
+    pub fn set_static_ips(&self, static_ips: HashMap<String, String>) {
+        *self.static_ips.write().unwrap() = static_ips;
+    }
+
     pub fn upsert(&self, ed_pub: &str, req: &api::RegisterRequest) -> Result<String, StoreError> {
+        let statics = self.static_ips.read().unwrap().clone();
+        let mut blocked = self.reserved.clone();
+        blocked.extend(statics.values().cloned());
         let mut g = self.inner.lock().unwrap();
-        let mesh_ip = match g.nodes.get(ed_pub) {
-            Some(n) => n.mesh_ip.clone(),
-            None => allocate_locked(&mut g, self.network, self.prefix_bits, &self.reserved)?,
+        let mesh_ip = match statics.get(ed_pub) {
+            Some(pinned) => {
+                // A reservation wins over whatever state.json says: move any
+                // other holder to a fresh dynamic IP so /peers never shows
+                // two nodes on one address.
+                let holders: Vec<String> = g
+                    .nodes
+                    .iter()
+                    .filter(|(k, n)| k.as_str() != ed_pub && n.mesh_ip == *pinned)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in holders {
+                    let fresh = allocate_locked(&mut g, self.network, self.prefix_bits, &blocked)?;
+                    if let Some(n) = g.nodes.get_mut(&k) {
+                        n.mesh_ip = fresh;
+                    }
+                }
+                pinned.clone()
+            }
+            None => match g.nodes.get(ed_pub) {
+                // Keep a dynamic IP unless it has since been reserved.
+                Some(n) if !blocked.contains(&n.mesh_ip) => n.mesh_ip.clone(),
+                _ => allocate_locked(&mut g, self.network, self.prefix_bits, &blocked)?,
+            },
         };
         let node = Node {
             ed_pub: ed_pub.to_string(),
@@ -135,6 +167,7 @@ impl Store {
         signers: &crate::signers::Signers,
     ) -> Vec<api::Peer> {
         let authorized = signers.snapshot();
+        let statics = self.static_ips.read().unwrap().clone();
         let g = self.inner.lock().unwrap();
         let cutoff = Utc::now()
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -168,6 +201,10 @@ impl Store {
                         && addr != self.network
                         && addr != (self.network | !mask)
                         && !self.reserved.contains(&n.mesh_ip)
+                        // Reserved for another key: stale until this node re-registers.
+                        && statics
+                            .iter()
+                            .all(|(k, ip)| *ip != n.mesh_ip || *k == n.ed_pub)
                         && ip_counts.get(&n.mesh_ip) == Some(&1)
                 });
                 valid_ip
@@ -404,5 +441,93 @@ mod tests {
         assert!(store
             .authorized_peers("", Duration::from_secs(600), &signers)
             .is_empty());
+    }
+
+    fn open_with_statics(statics: &[(&str, &str)]) -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let s = Store::open(
+            path.to_str().unwrap(),
+            Ipv4Addr::new(10, 42, 0, 0),
+            16,
+            &["10.42.0.1"],
+        )
+        .unwrap();
+        s.set_static_ips(
+            statics
+                .iter()
+                .map(|(k, ip)| ((*k).to_string(), (*ip).to_string()))
+                .collect(),
+        );
+        (s, dir)
+    }
+
+    #[test]
+    fn dynamic_allocation_skips_static_ips() {
+        // Dynamic allocation starts at 10.42.0.2; pin that and the next one.
+        let (s, _d) = open_with_statics(&[("pinned", "10.42.0.2"), ("pinned2", "10.42.0.3")]);
+        assert_eq!(s.upsert("dyn", &req()).unwrap(), "10.42.0.4");
+        assert_eq!(s.upsert("pinned", &req()).unwrap(), "10.42.0.2");
+    }
+
+    #[test]
+    fn static_ip_overrides_previous_dynamic_ip() {
+        let (s, _d) = open_with_statics(&[]);
+        let first = s.upsert("a", &req()).unwrap();
+        s.set_static_ips(HashMap::from([("a".into(), "10.42.0.50".into())]));
+        assert_eq!(s.upsert("a", &req()).unwrap(), "10.42.0.50");
+        assert_ne!(first, "10.42.0.50");
+        assert_eq!(s.mesh_ip_cidr("a").unwrap(), "10.42.0.50/16");
+        // And it is stable, not re-allocated.
+        assert_eq!(s.upsert("a", &req()).unwrap(), "10.42.0.50");
+    }
+
+    #[test]
+    fn static_ip_steals_from_other_node_which_gets_a_fresh_one() {
+        let (s, _d) = open_with_statics(&[]);
+        let taken = s.upsert("other", &req()).unwrap();
+        s.set_static_ips(HashMap::from([("owner".into(), taken.clone())]));
+        assert_eq!(s.upsert("owner", &req()).unwrap(), taken);
+        let g = s.inner.lock().unwrap();
+        let other_ip = g.nodes["other"].mesh_ip.clone();
+        assert_ne!(other_ip, taken);
+        assert_eq!(g.nodes["owner"].mesh_ip, taken);
+        drop(g);
+        // The evicted node keeps its new IP on re-register.
+        assert_eq!(s.upsert("other", &req()).unwrap(), other_ip);
+    }
+
+    #[test]
+    fn dynamic_node_holding_newly_reserved_ip_is_reallocated_on_register() {
+        let (s, _d) = open_with_statics(&[]);
+        let ip = s.upsert("dyn", &req()).unwrap();
+        s.set_static_ips(HashMap::from([("absent".into(), ip.clone())]));
+        let new_ip = s.upsert("dyn", &req()).unwrap();
+        assert_ne!(new_ip, ip);
+    }
+
+    #[test]
+    fn stale_holder_of_reserved_ip_is_not_advertised() {
+        let (s, _d) = open_with_statics(&[]);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ed.as_bytes());
+        let mut r = req();
+        r.wg_public_key = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            wgmesh_core::keyderive::wg_pub_from_ed25519_pub(ed.as_bytes()).unwrap(),
+        );
+        let ip = s.upsert(&key, &r).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir.path().join("signers");
+        let pk = ssh_key::PublicKey::new(
+            ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(*ed.as_bytes())),
+            "t",
+        );
+        std::fs::write(&sp, pk.to_openssh().unwrap()).unwrap();
+        let signers = crate::signers::Signers::load(sp.to_str().unwrap()).unwrap();
+        let ttl = Duration::from_secs(600);
+        assert_eq!(s.authorized_peers("", ttl, &signers).len(), 1);
+        s.set_static_ips(HashMap::from([("someone-else".into(), ip)]));
+        assert!(s.authorized_peers("", ttl, &signers).is_empty());
     }
 }

@@ -86,6 +86,7 @@ fn make_cfg(state: &Path, signers_path: &Path) -> Arc<wgmesh_coord::config::Conf
         wg_listen_port: 0,
         wg_endpoint_host: String::new(),
         wg_mesh_ip: String::new(),
+        static_ips: Default::default(),
         network_addr: Ipv4Addr::new(10, 42, 0, 0),
         prefix_bits: 16,
     })
@@ -421,4 +422,41 @@ async fn persisted_legacy_injection_is_not_advertised() {
         .authorized_peers("", Duration::from_secs(600), &signers)
         .is_empty());
     drop(app);
+}
+
+#[tokio::test]
+async fn register_with_reserved_key_gets_reserved_ip_and_others_avoid_it() {
+    let pinned = TestNode::new();
+    let other = TestNode::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sp = dir.path().join("authorized_signers");
+    std::fs::write(&sp, format!("{}\n{}\n", pinned.line, other.line)).unwrap();
+    let cfg = make_cfg(&dir.path().join("state.json"), &sp);
+    let store =
+        Arc::new(Store::open(&cfg.state_path, cfg.network_addr, cfg.prefix_bits, &[]).unwrap());
+    // 10.42.0.1 is what dynamic allocation would hand out first.
+    let reserved = sig::ed_pub_b64_from_authorized_line(&pinned.line).unwrap();
+    store.set_static_ips([(reserved, "10.42.0.1".to_string())].into());
+    let app = build_app(AppState {
+        cfg,
+        store,
+        signers: Signers::load(sp.to_str().unwrap()).unwrap(),
+        relay: None,
+    });
+
+    let register = |n: &TestNode| {
+        let body = serde_json::to_vec(&n.registration()).unwrap();
+        let req = n.signed_request("POST", "/register", &body);
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let r: api::RegisterResponse =
+                serde_json::from_slice(&body_to_bytes(resp.into_body()).await).unwrap();
+            r.mesh_ip
+        }
+    };
+    // The dynamic node registers first, yet must not receive the reserved IP.
+    assert_ne!(register(&other).await, "10.42.0.1/16");
+    assert_eq!(register(&pinned).await, "10.42.0.1/16");
 }

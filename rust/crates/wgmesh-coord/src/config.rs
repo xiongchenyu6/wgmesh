@@ -5,6 +5,7 @@
 //! when empty, agents derive the host from their own `coordinator` URL.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use thiserror::Error;
@@ -25,6 +26,8 @@ pub enum ConfigError {
     MissingAuthorizedSigners,
     #[error("wg_mesh_ip {0} is not a valid IPv4 inside mesh_cidr")]
     InvalidWgMeshIp(String),
+    #[error("static_ips: {0}")]
+    StaticIps(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +46,8 @@ struct Raw {
     /// Empty → agents derive it from their `coordinator` URL host.
     wg_endpoint_host: Option<String>,
     wg_mesh_ip: Option<String>,
+    /// Mesh IP → OpenSSH public key line (comment ignored).
+    static_ips: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +66,9 @@ pub struct Config {
     /// May be empty — agents derive from coordinator URL when so.
     pub wg_endpoint_host: String,
     pub wg_mesh_ip: String,
+    /// Pinned mesh IPs, keyed by the node's raw ed25519 key (base64, the
+    /// same identity `Store` uses). Validated against `mesh_cidr`.
+    pub static_ips: HashMap<String, String>,
 
     /// Network address of `mesh_cidr`, masked. Used by Store for allocation.
     pub network_addr: Ipv4Addr,
@@ -121,6 +129,13 @@ fn from_raw(raw: Raw) -> Result<Config, ConfigError> {
         }
     };
 
+    let static_ips = parse_static_ips(
+        raw.static_ips.unwrap_or_default(),
+        network_addr,
+        prefix_bits,
+        &wg_mesh_ip,
+    )?;
+
     Ok(Config {
         listen_addr: raw.listen_addr.unwrap_or_else(|| ":8443".into()),
         tls_cert: raw.tls_cert.filter(|s| !s.is_empty()),
@@ -134,9 +149,51 @@ fn from_raw(raw: Raw) -> Result<Config, ConfigError> {
         wg_listen_port,
         wg_endpoint_host,
         wg_mesh_ip,
+        static_ips,
         network_addr,
         prefix_bits,
     })
+}
+
+/// Validate `static_ips` (IP → SSH key line) and re-key it by raw ed25519
+/// key. Each IP must be a usable host address inside the mesh, differ from
+/// the coordinator's own, and each key may appear only once.
+fn parse_static_ips(
+    raw: HashMap<String, String>,
+    network: Ipv4Addr,
+    prefix_bits: u8,
+    coord_ip: &str,
+) -> Result<HashMap<String, String>, ConfigError> {
+    let err = |m: String| ConfigError::StaticIps(m);
+    let mask = if prefix_bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_bits)
+    };
+    let broadcast = u32::from(network) | !mask;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (ip_str, key_line) in raw {
+        let ip: Ipv4Addr = ip_str
+            .parse()
+            .map_err(|_| err(format!("{ip_str} is not a valid IPv4 address")))?;
+        if !ipv4_in_cidr(ip, network, prefix_bits) {
+            return Err(err(format!("{ip_str} is outside mesh_cidr")));
+        }
+        if u32::from(ip) == u32::from(network) || u32::from(ip) == broadcast {
+            return Err(err(format!("{ip_str} is the network or broadcast address")));
+        }
+        if ip_str == coord_ip {
+            return Err(err(format!("{ip_str} is the coordinator's own mesh IP")));
+        }
+        let key = wgmesh_core::sig::ed_pub_b64_from_authorized_line(&key_line)
+            .map_err(|e| err(format!("key for {ip_str}: {e}")))?;
+        if let Some(prev) = out.insert(key, ip_str.clone()) {
+            return Err(err(format!(
+                "the same key is reserved for both {prev} and {ip_str}"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// Parse `"10.42.0.0/16"` into (network address, prefix bits).
@@ -216,5 +273,72 @@ mod tests {
         .unwrap();
         let cfg = from_raw(raw).unwrap();
         assert_eq!(cfg.listen_addr_normalized(), "0.0.0.0:8443");
+    }
+
+    fn key_line(seed: u8) -> String {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let kd = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(
+            sk.verifying_key().to_bytes(),
+        ));
+        ssh_key::PublicKey::new(kd, "test").to_openssh().unwrap()
+    }
+
+    fn cfg_with_static(ips: serde_json::Value) -> Result<Config, ConfigError> {
+        let raw: Raw = serde_json::from_value(serde_json::json!({
+            "mesh_cidr": "10.42.0.0/16",
+            "state_path": "/tmp/s",
+            "authorized_signers": "/tmp/a",
+            "static_ips": ips,
+        }))
+        .unwrap();
+        from_raw(raw)
+    }
+
+    #[test]
+    fn static_ips_default_empty_and_comment_is_ignored() {
+        let key_a = key_line(1);
+        let cfg = cfg_with_static(serde_json::json!({})).unwrap();
+        assert!(cfg.static_ips.is_empty());
+        let a = cfg_with_static(serde_json::json!({"10.42.0.10": &key_a})).unwrap();
+        let b =
+            cfg_with_static(serde_json::json!({"10.42.0.10": format!("{key_a} other comment")}))
+                .unwrap();
+        assert_eq!(a.static_ips, b.static_ips);
+        assert_eq!(a.static_ips.values().next().unwrap(), "10.42.0.10");
+    }
+
+    #[test]
+    fn static_ips_rejects_bad_entries() {
+        let key_a = key_line(1);
+        for (ip, why) in [
+            ("nonsense", "not an IP"),
+            ("192.0.2.5", "outside mesh"),
+            ("10.42.0.0", "network address"),
+            ("10.42.255.255", "broadcast"),
+            ("10.42.0.1", "coordinator's own IP"),
+        ] {
+            let r = cfg_with_static(serde_json::json!({ ip: &key_a }));
+            assert!(
+                matches!(r, Err(ConfigError::StaticIps(_))),
+                "accepted {why}"
+            );
+        }
+        let r = cfg_with_static(serde_json::json!({"10.42.0.10": "ssh-ed25519 garbage"}));
+        assert!(matches!(r, Err(ConfigError::StaticIps(_))));
+    }
+
+    #[test]
+    fn static_ips_rejects_duplicate_key() {
+        let (key_a, key_b) = (key_line(1), key_line(2));
+        let r = cfg_with_static(serde_json::json!({
+            "10.42.0.10": &key_a,
+            "10.42.0.11": format!("{key_a} again"),
+        }));
+        assert!(matches!(r, Err(ConfigError::StaticIps(_))));
+        assert!(cfg_with_static(serde_json::json!({
+            "10.42.0.10": &key_a,
+            "10.42.0.11": &key_b,
+        }))
+        .is_ok());
     }
 }
