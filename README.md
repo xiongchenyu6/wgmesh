@@ -44,7 +44,8 @@ node joins when it appears in `nodes` on every host and the hosts are rebuilt.
 ```
 
 `hostName` defaults to `networking.hostName` and selects this host's entry in
-`nodes`. The relay needs a public endpoint and gets `net.ipv4.ip_forward`; the
+`nodes`. `relayPrefixes` adds prefixes outside the mesh that the other nodes route
+through the relay, for a network the relay is a gateway to. The relay needs a public endpoint and gets `net.ipv4.ip_forward`; the
 others only need outbound UDP. The WireGuard port (default 51820) and the gossip
 port (1666) are opened in the firewall.
 

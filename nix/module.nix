@@ -75,6 +75,13 @@ in
       description = "Name of the publicly reachable node that forwards traffic between nodes that cannot connect directly.";
     };
 
+    relayPrefixes = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "172.20.0.0/14" ];
+      description = "Prefixes outside the mesh that the other nodes route through the relay, such as a network the relay is a gateway to.";
+    };
+
     privateKeyFile = mkOption {
       type = types.path;
       description = "File holding this host's WireGuard private key.";
@@ -128,7 +135,7 @@ in
       inherit (cfg) listenPort privateKeyFile;
       peers = lib.optional (!isRelay) {
         inherit (relay) publicKey endpoint;
-        allowedIPs = [ cfg.cidr ];
+        allowedIPs = [ cfg.cidr ] ++ cfg.relayPrefixes;
         persistentKeepalive = 25;
       };
     };

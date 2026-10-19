@@ -59,6 +59,7 @@ let
         enable = true;
         cidr = "10.42.0.0/24";
         relay = "relay";
+        relayPrefixes = [ "192.0.2.0/24" ];
         privateKeyFile = "/etc/wgmesh/private";
         gossipSecretFile = "/etc/wgmesh/gossip";
         nodes = builtins.mapAttrs (n: k: {
@@ -79,10 +80,21 @@ in
 pkgs.testers.runNixOSTest {
   name = "wgmesh";
   nodes = {
-    relay = node "relay" [
-      1
-      2
-    ];
+    # 192.0.2.1 stands for a network the relay is a gateway to.
+    relay = {
+      imports = [
+        (node "relay" [
+          1
+          2
+        ])
+      ];
+      networking.interfaces.lo.ipv4.addresses = [
+        {
+          address = "192.0.2.1";
+          prefixLength = 32;
+        }
+      ];
+    };
     a = node "a" [ 1 ];
     b = node "b" [ 2 ];
     # c builds its interface through networkd, the others through scripts.
@@ -107,6 +119,10 @@ pkgs.testers.runNixOSTest {
         a.wait_until_succeeds("ping -c1 -W2 10.42.0.3", timeout=120)
         b.succeed("ping -c3 -W2 10.42.0.2")
         a.succeed("wg show wgmesh allowed-ips | grep '${keys.b.public}' | grep -q '(none)'")
+
+    with subtest("relayPrefixes are routed through the relay"):
+        a.succeed("ip route get 192.0.2.1 | grep -q 'dev wgmesh'")
+        a.succeed("ping -c3 -W2 192.0.2.1")
 
     with subtest("relay keeps a /32 for every node"):
         for addr in ["10.42.0.2", "10.42.0.3", "10.42.0.4"]:

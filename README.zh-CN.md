@@ -38,7 +38,8 @@ wgmesh 只是一个 NixOS 模块,外加给 [wgautomesh](https://git.deuxfleurs.f
 }
 ```
 
-`hostName` 默认取 `networking.hostName`,用来在 `nodes` 里找到本机。中继需要公网 endpoint,
+`hostName` 默认取 `networking.hostName`,用来在 `nodes` 里找到本机。`relayPrefixes`
+是 mesh 之外、其余节点经中继访问的网段(中继充当网关的网络)。中继需要公网 endpoint,
 并会打开 `net.ipv4.ip_forward`;其余节点只需要能出站 UDP。防火墙会放行 WireGuard 端口
 (默认 51820)和 gossip 端口(1666)。
 
