@@ -169,6 +169,11 @@ socket. No separate STUN service is needed. `stunServer` is a deprecated
 compatibility option: leave it empty because running kernel WG owns that UDP
 port. An ephemeral socket's mapping is never advertised. Each direct candidate gets a 60-second probe window before
 the agent tries the next one, then falls back to the relay with backoff.
+To keep unreachable addresses out of that list, `services.wgmesh.skipInterfaces`
+(default: `lo`, `docker*`, `br-*`, `veth*`, `virbr*`, `podman*`, `wt*`,
+`tailscale*`, `zt*`) excludes interfaces from LAN candidates: an entry ending
+in `*` is a prefix match, anything else is an exact name. The agent's own
+interface is always skipped.
 
 Onboarding a new node is two declarative steps:
 
@@ -531,10 +536,10 @@ cd rust && cargo test --workspace
 | `wgmesh-wglink`       | 6     | syncconf rendering, `wg show dump` parsing |
 | `wgmesh-coord` (unit) | 22    | config defaults/`static_ips` validation, store IP allocation/persistence/reservations, reload |
 | `wgmesh-coord` (e2e)  | 9     | register, /peers, signer rejection, healthz, reserved IPs |
-| `wgmesh-agent`        | 18     | probe state machine (all transitions), LAN filtering |
+| `wgmesh-agent`        | 21     | probe state machine (all transitions), LAN filtering, skip-interface matching |
 | `wgmesh-coord` (TLS)  | 2     | HTTPS handshake, plain HTTP rejection, invalid TLS config |
 | `ssh-to-wg`           | 6     | CLI argument parsing                    |
-| **Total**             | **78**|                                         |
+| **Total**             | **81**|                                         |
 
 Linux CI also builds the binaries and runs `sudo bash tests/kernel-mesh.sh`
 in isolated network namespaces, checking relay forwarding, direct promotion,

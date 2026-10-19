@@ -66,8 +66,15 @@ in
 
     skipInterfaces = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "docker0" "lo" ];
-      description = "Interface names to ignore when collecting LAN endpoints.";
+      default = [ "lo" "docker*" "br-*" "veth*" "virbr*" "podman*" "wt*" "tailscale*" "zt*" ];
+      description = ''
+        Interface names to ignore when collecting LAN endpoints. An entry
+        ending in `*` is a prefix match (`br-*` skips `br-1a2b3c`); other
+        entries match exactly. The agent's own WireGuard interface is
+        always skipped. Skipping container bridges and other overlay
+        interfaces avoids advertising addresses peers cannot reach, each of
+        which would cost a 60 s probe window.
+      '';
     };
 
     openFirewall = lib.mkOption {
