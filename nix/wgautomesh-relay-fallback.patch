@@ -1,8 +1,7 @@
 diff --git a/src/main.rs b/src/main.rs
-index 88336f4..bf040ba 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -49,6 +49,12 @@ struct Config {
+@@ -49,6 +49,12 @@
      /// Forward an external port to Wiregard using UPnP IGD
      upnp_forward_external_port: Option<u16>,
  
@@ -15,7 +14,7 @@ index 88336f4..bf040ba 100644
      /// The list of peers we try to connect to
      #[serde(default)]
      peers: Vec<Peer>,
-@@ -610,12 +616,23 @@ impl State {
+@@ -610,12 +616,23 @@
                              &peer_cfg.pubkey,
                              "persistent-keepalive",
                              "30",
@@ -39,7 +38,33 @@ index 88336f4..bf040ba 100644
              // For disconnected peers, cycle through the endpoint addresses that we know of
              let lan_endpoint = self
                  .peers
-@@ -670,7 +687,7 @@ impl State {
+@@ -654,7 +671,24 @@
+                     .map(|x| x.endpoint == Some(endpoint))
+                     .unwrap_or(false)
+                 {
+-                    // Skip if we are already using that endpoint
++                    // Already dialing that endpoint. With relay fallback the
++                    // /32 installed while the peer was connected still has to
++                    // go, or traffic keeps leaving for the dead direct path
++                    // and the relayed replies fail the source check.
++                    if daemon.config.relay_fallback {
++                        Command::new("wg")
++                            .args([
++                                "set",
++                                &daemon.config.interface,
++                                "peer",
++                                &peer_cfg.pubkey,
++                                "persistent-keepalive",
++                                "10",
++                                "allowed-ips",
++                                "",
++                            ])
++                            .output()?;
++                    }
+                     continue;
+                 }
+ 
+@@ -670,7 +704,7 @@
                          "persistent-keepalive",
                          "10",
                          "allowed-ips",
@@ -48,7 +73,7 @@ index 88336f4..bf040ba 100644
                      ])
                      .output()?;
                  let packet = daemon.make_packet(&Gossip::Ping)?;
-@@ -687,7 +704,7 @@ impl State {
+@@ -687,7 +721,7 @@
                          "peer",
                          &peer_cfg.pubkey,
                          "allowed-ips",

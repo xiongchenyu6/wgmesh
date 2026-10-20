@@ -127,5 +127,15 @@ pkgs.testers.runNixOSTest {
     with subtest("relay keeps a /32 for every node"):
         for addr in ["10.42.0.2", "10.42.0.3", "10.42.0.4"]:
             relay.succeed(f"wg show wgmesh allowed-ips | grep -q '{addr}/32'")
+
+    with subtest("a dead direct path falls back to the relay"):
+        # c goes deaf to a. a keeps dialing the same (only) endpoint, so it
+        # must still drop the /32 once the handshake is older than wgautomesh's
+        # 300 s TIMEOUT, or a keeps sending into the void.
+        c.succeed("iptables -I INPUT -s 192.168.1.2 -p udp --dport 51820 -j DROP")
+        for m, peer in [(a, "${keys.c.public}"), (c, "${keys.a.public}")]:
+            m.wait_until_succeeds(f"wg show wgmesh allowed-ips | grep '{peer}' | grep -q '(none)'", timeout=600)
+        a.succeed("ping -c3 -W2 10.42.0.4")
+        c.succeed("iptables -D INPUT -s 192.168.1.2 -p udp --dport 51820 -j DROP")
   '';
 }
