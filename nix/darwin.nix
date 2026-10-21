@@ -10,13 +10,14 @@
 let
   inherit (lib) filterAttrs mapAttrsToList mkIf;
   cfg = config.services.wgmesh;
-  self = cfg.nodes.${cfg.hostName};
-  relay = cfg.nodes.${cfg.relay};
+  self = cfg.nodes.${cfg.hostName} or null;
+  relay = cfg.nodes.${cfg.relay} or null;
+  validNodes = self != null && relay != null;
   wgautomesh = lib.getExe cfg.package;
   wireguard-go = lib.getExe pkgs.wireguard-go;
   settings = (pkgs.formats.toml { }).generate "wgautomesh.toml" {
     inherit (cfg) interface;
-    gossip_port = 1666;
+    gossip_port = cfg.gossipPort;
     gossip_secret_file = cfg.gossipSecretFile;
     persist_file = "/var/db/wgautomesh.state";
     lan_discovery = true;
@@ -37,11 +38,11 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.nodes ? ${cfg.hostName};
+        assertion = self != null;
         message = "services.wgmesh.nodes has no entry for this host (${cfg.hostName}).";
       }
       {
-        assertion = cfg.nodes ? ${cfg.relay} && relay.endpoint != null;
+        assertion = relay != null && relay.endpoint != null;
         message = "services.wgmesh.relay (${cfg.relay}) must be a node with an endpoint.";
       }
       {
@@ -52,7 +53,7 @@ in
 
     # wg-quick routes the relay's allowed IPs into the interface, so the /32s
     # that wgautomesh adds on the same interface need no routes of their own.
-    networking.wg-quick.interfaces.${cfg.interface} = {
+    networking.wg-quick.interfaces.${cfg.interface} = mkIf validNodes {
       address = [ "${self.address}/32" ];
       inherit (cfg) listenPort privateKeyFile;
       peers = [
@@ -65,12 +66,12 @@ in
       autostart = true;
     };
 
-    environment.systemPackages = [ pkgs.wireguard-tools ];
+    environment.systemPackages = mkIf validNodes [ pkgs.wireguard-tools ];
 
     # Only wg-quick maps the interface name to its utun; `wg` itself needs the
     # utun name. A restarted tunnel gets a new utun, wgautomesh then fails on
     # `wg show` and launchd starts it again with the new name.
-    launchd.daemons.wgautomesh.serviceConfig = {
+    launchd.daemons.wgautomesh.serviceConfig = mkIf validNodes {
       ProgramArguments = [
         "/bin/sh"
         "-c"
@@ -90,8 +91,8 @@ in
     };
 
     # The application firewall would drop peers dialing in directly and
-    # gossip on UDP 1666; both binaries are unsigned store paths.
-    system.activationScripts.postActivation.text = ''
+    # gossip; both binaries are unsigned store paths.
+    system.activationScripts.postActivation.text = mkIf validNodes ''
       fw=/usr/libexec/ApplicationFirewall/socketfilterfw
       for app in ${wireguard-go} ${wgautomesh}; do
         $fw --add "$app" >/dev/null

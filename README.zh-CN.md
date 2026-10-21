@@ -29,6 +29,7 @@ wgmesh 只是一个 NixOS 模块,外加给 [wgautomesh](https://git.deuxfleurs.f
     relay = "hub";
     privateKeyFile = "/run/secrets/wireguard";
     gossipSecretFile = "/run/secrets/wgmesh-gossip"; # 所有节点相同
+    gossipPort = 1666;
     nodes = {
       hub = { address = "10.42.0.1"; publicKey = "..."; endpoint = "203.0.113.1:51820"; };
       laptop = { address = "10.42.0.20"; publicKey = "..."; };
@@ -41,12 +42,16 @@ wgmesh 只是一个 NixOS 模块,外加给 [wgautomesh](https://git.deuxfleurs.f
 `hostName` 默认取 `networking.hostName`,用来在 `nodes` 里找到本机。`relayPrefixes`
 是 mesh 之外、其余节点经中继访问的网段(中继充当网关的网络)。中继需要公网 endpoint,
 并会打开 `net.ipv4.ip_forward`;其余节点只需要能出站 UDP。防火墙会放行 WireGuard 端口
-(默认 51820)和 gossip 端口(1666)。
+(默认 51820)和 gossip 端口(默认 1666)。Nix 求值时会校验 `cidr` 和所有节点地址,
+包括重复地址以及地址不在 mesh 网段内的情况。
+
+在 nix-darwin 上，请改为导入 `inputs.wgmesh.darwinModules.default`。Darwin 节点使用
+`wg-quick` 和 `wireguard-go`;中继节点仍必须运行在 NixOS 上。
 
 ## 限制
 
 - IPv4 overlay,每个节点一个地址,不做子网路由。
-- 只支持 Linux(wgautomesh 在本机调用 `wg`)。
+- 支持 NixOS 和 nix-darwin 节点；中继节点必须运行在 NixOS 上。
 - 只有一个中继。两端都是对称 NAT 的节点会一直走中继。
 - wgautomesh 每 30 秒一轮,握手超时 5 分钟:新直连最多 30 秒两端才稳定;
   对端突然消失时,直连路由最多保留 5 分钟才回落到中继。

@@ -60,6 +60,7 @@ let
         cidr = "10.42.0.0/24";
         relay = "relay";
         relayPrefixes = [ "192.0.2.0/24" ];
+        gossipPort = 1667;
         privateKeyFile = "/etc/wgmesh/private";
         gossipSecretFile = "/etc/wgmesh/gossip";
         nodes = builtins.mapAttrs (n: k: {

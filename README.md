@@ -34,6 +34,7 @@ node joins when it appears in `nodes` on every host and the hosts are rebuilt.
     relay = "hub";
     privateKeyFile = "/run/secrets/wireguard";
     gossipSecretFile = "/run/secrets/wgmesh-gossip"; # same on every node
+    gossipPort = 1666;
     nodes = {
       hub = { address = "10.42.0.1"; publicKey = "..."; endpoint = "203.0.113.1:51820"; };
       laptop = { address = "10.42.0.20"; publicKey = "..."; };
@@ -47,12 +48,18 @@ node joins when it appears in `nodes` on every host and the hosts are rebuilt.
 `nodes`. `relayPrefixes` adds prefixes outside the mesh that the other nodes route
 through the relay, for a network the relay is a gateway to. The relay needs a public endpoint and gets `net.ipv4.ip_forward`; the
 others only need outbound UDP. The WireGuard port (default 51820) and the gossip
-port (1666) are opened in the firewall.
+port (default 1666) are opened in the NixOS firewall. `cidr` and every node
+address are validated during Nix evaluation, including duplicate and
+out-of-prefix addresses.
+
+On nix-darwin, import `inputs.wgmesh.darwinModules.default` instead. Darwin
+nodes use `wg-quick` with `wireguard-go`; the relay itself must remain a NixOS
+host.
 
 ## Limits
 
 - IPv4 overlay, one address per node: no subnet routing.
-- Linux only (wgautomesh drives `wg` on the host).
+- NixOS and nix-darwin nodes are supported; the relay must run on NixOS.
 - One relay. Nodes behind symmetric NAT on both sides stay relayed.
 - wgautomesh works on a 30 s loop with a 5 min handshake timeout: a new direct
   path takes up to 30 s to settle on both sides, and a peer that vanishes keeps

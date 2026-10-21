@@ -6,7 +6,52 @@
   ...
 }:
 let
-  inherit (lib) mkEnableOption mkOption types;
+  inherit (lib)
+    mkEnableOption
+    mkIf
+    mkOption
+    types
+    ;
+  cfg = config.services.wgmesh;
+
+  parseIPv4 =
+    value:
+    let
+      parts = builtins.match "^([0-9]+)\\.([0-9]+)\\.([0-9]+)\\.([0-9]+)$" value;
+      octets = if parts == null then [ ] else map lib.toInt parts;
+    in
+    if parts != null && lib.all (octet: octet <= 255) octets then octets else null;
+
+  ipv4ToInt = octets: builtins.foldl' (value: octet: value * 256 + octet) 0 octets;
+  pow2 = exponent: if exponent == 0 then 1 else 2 * pow2 (exponent - 1);
+
+  parseCIDR =
+    value:
+    let
+      parts = builtins.match "^([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)/([0-9]+)$" value;
+      address = if parts == null then null else parseIPv4 (builtins.elemAt parts 0);
+      prefixLength = if parts == null then null else lib.toInt (builtins.elemAt parts 1);
+    in
+    if parts != null && address != null && prefixLength >= 0 && prefixLength <= 32 then
+      {
+        inherit address prefixLength;
+        mask = if prefixLength == 0 then 0 else pow2 32 - pow2 (32 - prefixLength);
+      }
+    else
+      null;
+
+  cidr = parseCIDR cfg.cidr;
+  nodeAddresses = map (node: parseIPv4 node.address) (builtins.attrValues cfg.nodes);
+  nodeAddressInts = map ipv4ToInt (lib.filter (address: address != null) nodeAddresses);
+  addressesInCIDR =
+    address:
+    if address == null || cidr == null then
+      false
+    else
+      let
+        addressInt = ipv4ToInt address;
+      in
+      builtins.bitAnd addressInt cidr.mask == builtins.bitAnd (ipv4ToInt cidr.address) cidr.mask;
 in
 {
   options.services.wgmesh = {
@@ -68,6 +113,12 @@ in
       description = "File holding the secret shared by all nodes to encrypt gossip.";
     };
 
+    gossipPort = mkOption {
+      type = types.port;
+      default = 1666;
+      description = "UDP port used for encrypted endpoint gossip; it is opened in the firewall.";
+    };
+
     nodes = mkOption {
       description = "Every node in the mesh, including this host.";
       type = types.attrsOf (
@@ -92,5 +143,30 @@ in
         }
       );
     };
+  };
+
+  config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cidr != null;
+        message = "services.wgmesh.cidr must be a valid IPv4 CIDR.";
+      }
+      {
+        assertion = lib.all (address: address != null) nodeAddresses;
+        message = "Every services.wgmesh.nodes.<name>.address must be a valid IPv4 address.";
+      }
+      {
+        assertion = lib.length nodeAddressInts == lib.length (lib.unique nodeAddressInts);
+        message = "services.wgmesh.nodes must not contain duplicate IPv4 addresses.";
+      }
+      {
+        assertion = cidr != null && lib.all addressesInCIDR nodeAddresses;
+        message = "Every services.wgmesh.nodes.<name>.address must be inside services.wgmesh.cidr.";
+      }
+      {
+        assertion = lib.all (prefix: parseCIDR prefix != null) cfg.relayPrefixes;
+        message = "Every services.wgmesh.relayPrefixes entry must be a valid IPv4 CIDR.";
+      }
+    ];
   };
 }

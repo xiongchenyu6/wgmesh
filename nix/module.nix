@@ -14,8 +14,9 @@
 let
   inherit (lib) filterAttrs mapAttrsToList mkIf;
   cfg = config.services.wgmesh;
-  self = cfg.nodes.${cfg.hostName};
-  relay = cfg.nodes.${cfg.relay};
+  self = cfg.nodes.${cfg.hostName} or null;
+  relay = cfg.nodes.${cfg.relay} or null;
+  validNodes = self != null && relay != null;
   isRelay = cfg.hostName == cfg.relay;
   prefixLength = lib.last (lib.splitString "/" cfg.cidr);
   # The relay meshes with everyone; the others leave the relay to
@@ -30,16 +31,16 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.nodes ? ${cfg.hostName};
+        assertion = self != null;
         message = "services.wgmesh.nodes has no entry for this host (${cfg.hostName}).";
       }
       {
-        assertion = cfg.nodes ? ${cfg.relay} && relay.endpoint != null;
+        assertion = relay != null && relay.endpoint != null;
         message = "services.wgmesh.relay (${cfg.relay}) must be a node with an endpoint.";
       }
     ];
 
-    networking.wireguard.interfaces.${cfg.interface} = {
+    networking.wireguard.interfaces.${cfg.interface} = mkIf validNodes {
       ips = [ "${self.address}/${prefixLength}" ];
       inherit (cfg) listenPort privateKeyFile;
       peers = lib.optional (!isRelay) {
@@ -49,14 +50,18 @@ in
       };
     };
 
-    networking.firewall.allowedUDPPorts = [ cfg.listenPort ];
-    boot.kernel.sysctl."net.ipv4.ip_forward" = mkIf isRelay (lib.mkDefault 1);
+    networking.firewall.allowedUDPPorts = mkIf validNodes [
+      cfg.listenPort
+      cfg.gossipPort
+    ];
+    boot.kernel.sysctl."net.ipv4.ip_forward" = mkIf (validNodes && isRelay) (lib.mkDefault 1);
 
-    services.wgautomesh = {
+    services.wgautomesh = mkIf validNodes {
       enable = true;
       inherit (cfg) gossipSecretFile;
       settings = {
         inherit (cfg) interface;
+        gossip_port = cfg.gossipPort;
         relay_fallback = !isRelay;
         peers = mapAttrsToList (_: node: {
           pubkey = node.publicKey;
@@ -65,7 +70,7 @@ in
       };
     };
 
-    systemd.services.wgautomesh = {
+    systemd.services.wgautomesh = mkIf validNodes {
       # The stock unit runs pkgs.wgautomesh; with gossip encryption on, its
       # rendered config always lives at this runtime path.
       serviceConfig.ExecStart = lib.mkForce "${lib.getExe cfg.package} /run/wgautomesh/wgautomesh.toml";
